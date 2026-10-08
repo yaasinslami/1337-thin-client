@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+# Managed by thin-client-setup
+"""Explicit, non-destructive native Brave/VS Code setup for this thin client.
+
+Commands: install (download/update), migrate (copy once), integrate (launchers),
+prepare (all three), status, open brave|code [arguments]. Launchers NEVER download.
+No sudo, process killing, old-profile removal, shell/SSH edits or home fallback.
+Official-download ideas adapted from shank187/session-setup (MIT); see
+README.md and THIRD_PARTY_NOTICES.md for attribution and storage details.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.parse
+import zipfile
+
+HOME = Path.home()
+BRAVE = HOME / '.config/BraveSoftware/Brave-Browser'
+CODE = HOME / '.config/Code-Thin'
+OLD_BRAVE = HOME / '.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser'
+OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
+STATE = HOME / '.local/share/thin-client'
+SELF = HOME / '.local/bin/thin-client-setup'
+CACHE_NAMES = {'Cache', 'Code Cache', 'GPUCache', 'GPUPersistentCache',
+               'GrShaderCache', 'ShaderCache', 'GraphiteDawnCache',
+               'DawnGraphiteCache', 'DawnWebGPUCache', 'CacheStorage',
+               'ScriptCache', 'component_crx_cache', 'extensions_crx_cache',
+               'Crash Reports', 'Crashpad', 'BrowserMetrics', 'BrowserMetrics-spare.pma'}
+CODE_CACHES = ['Cache', 'Code Cache', 'CachedData', 'CachedProfilesData',
+               'CachedExtensionVSIXs', 'GPUCache', 'DawnGraphiteCache',
+               'DawnWebGPUCache', 'logs', 'Crashpad']
+EXTENSIONS = ['ms-vscode-remote.remote-ssh', 'ms-vscode-remote.remote-ssh-edit']
+APP_IDS = {'brave': 'com.brave.Browser', 'vscode': 'com.visualstudio.code'}
+
+def parse_jsonc(text):
+    """Remove JSON comments/trailing commas without changing string contents."""
+    result, i, quoted = [], 0, False
+    while i < len(text):
+        char = text[i]
+        if quoted:
+            result.append(char)
+            if char == '\\' and i + 1 < len(text):
+                i += 1
+                result.append(text[i])
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+            result.append(char)
+        elif text.startswith('//', i):
+            end = text.find('\n', i)
+            i = len(text) if end < 0 else end
+            result.append('\n')
+        elif text.startswith('/*', i):
+            end = text.find('*/', i + 2)
+            if end < 0:
+                raise RuntimeError('Unterminated settings comment')
+            result.append(' ')
+            i = end + 1
+        elif char == ',':
+            # Comments after a trailing comma are handled in a second pass.
+            result.append(char)
+        else:
+            result.append(char)
+        i += 1
+    cleaned = ''.join(result)
+    result, i, quoted = [], 0, False
+    while i < len(cleaned):
+        char = cleaned[i]
+        if quoted:
+            result.append(char)
+            if char == '\\' and i + 1 < len(cleaned):
+                i += 1
+                result.append(cleaned[i])
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+            result.append(char)
+        elif char == ',':
+            j = i + 1
+            while j < len(cleaned) and cleaned[j].isspace():
+                j += 1
+            if j >= len(cleaned) or cleaned[j] not in '}]':
+                result.append(char)
+        else:
+            result.append(char)
+        i += 1
+    value = json.loads(''.join(result))
+    if not isinstance(value, dict):
+        raise RuntimeError('Expected a settings object')
+    return value
+
+def run(args, **kwargs):
+    return subprocess.run([str(a) for a in args], check=True, **kwargs)
+
+def safe(path):
+    """Reject symlink ancestors for managed data paths (cache links are explicit)."""
+    if path.resolve() != path.absolute():
+        raise RuntimeError(f'Unexpected symlink in path: {path}')
+    return path
+
+def goinfre():
+    # Prefer the real account-owned home/goinfre link over a guessed login name.
+    candidate = os.environ.get('GOINFRE')
+    if candidate:
+        root = Path(candidate).resolve()
+    elif (HOME / 'goinfre').is_dir():
+        root = (HOME / 'goinfre').resolve()
+    else:
+        root = Path('/goinfre') / HOME.name
+    validate_goinfre(root, HOME)
+    return safe(root / 'thin-client')
+
+def validate_goinfre(root, home):
+    root, home = Path(root).resolve(), Path(home).resolve()
+    if not root.is_dir() or root.stat().st_uid != os.getuid():
+        raise RuntimeError(f'No existing account-owned goinfre: {root}')
+    if not os.access(root, os.W_OK | os.X_OK):
+        raise RuntimeError(f'Goinfre is not writable: {root}')
+    if root == home or home in root.parents or root in home.parents:
+        raise RuntimeError('Goinfre must be outside HOME, not an ancestor of HOME')
+    if root.stat().st_dev == home.stat().st_dev:
+        raise RuntimeError('Goinfre must be on a separate filesystem from HOME')
+    return root
+
+def stopped(apps=('brave', 'vscode')):
+    # /proc can be namespace-filtered in Codex; flatpak ps is also mandatory.
+    if shutil.which('flatpak'):
+        r = run(['flatpak', 'ps', '--columns=application'], capture_output=True, text=True)
+        ids = [APP_IDS[a] for a in apps]
+        if any(x in r.stdout.splitlines() for x in ids):
+            raise RuntimeError('Quit the relevant Flatpak applications before proceeding')
+    names = set()
+    if 'brave' in apps:
+        names.update(['brave', 'brave-browser'])
+    if 'vscode' in apps:
+        names.update(['code', 'code-insiders'])
+    r = run(['ps', '-eo', 'uid=,pid=,comm='], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0] == str(os.getuid()) and fields[2].lower() in names:
+            raise RuntimeError(f'Quit application before migration/update: {fields[2]} PID {fields[1]}')
+
+def url_checked(url):
+    p = urllib.parse.urlparse(url)
+    host = p.hostname or ''
+    allowed = ['versions.brave.com', 'github.com', 'update.code.visualstudio.com',
+               'vscode.download.prss.microsoft.com', 'az764295.vo.msecnd.net']
+    if p.scheme != 'https' or p.username or p.password or host not in allowed:
+        raise RuntimeError(f'Unexpected official download URL host: {host}')
+    return url
+
+def fetch(url, path):
+    url_checked(url)
+    run(['curl', '-fL', '--proto', '=https', '--proto-redir', '=https',
+         '--connect-timeout', '20', '--max-time', '600', '--retry', '2',
+         '-o', path, url])
+
+def text_url(url, directory, name):
+    p = directory / name
+    fetch(url, p)
+    return p.read_text().strip()
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for block in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+def verify_checksum(path, expected):
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', expected) or digest(path).lower() != expected.lower():
+        raise RuntimeError('SHA-256 verification failed; existing installation unchanged')
+
+def extract(archive, dest, kind):
+    """Reject archive traversal, special files and links escaping extraction root."""
+    safe(dest)
+    if any(dest.iterdir()):
+        raise RuntimeError('Extraction requires an empty private directory')
+    def inside(name):
+        p = PurePosixPath(name)
+        if not name or p.is_absolute() or '..' in p.parts or '\\' in name:
+            raise RuntimeError('Unsafe archive member path')
+    if kind == 'zip':
+        with zipfile.ZipFile(archive) as z:
+            for m in z.infolist():
+                inside(m.filename)
+                mode = m.external_attr >> 16
+                if stat.S_IFMT(mode) not in [0, stat.S_IFREG, stat.S_IFDIR]:
+                    raise RuntimeError('Unexpected special file/link in Brave ZIP')
+            z.extractall(dest)
+            for m in z.infolist():
+                p = dest / m.filename
+                mode = (m.external_attr >> 16) & 0o777
+                if mode:
+                    p.chmod(mode)
+    else:
+        with tarfile.open(archive, 'r:gz') as t:
+            members = t.getmembers()
+            links = {PurePosixPath(m.name) for m in members if m.issym() or m.islnk()}
+            seen = set()
+            for m in members:
+                inside(m.name)
+                name = PurePosixPath(m.name)
+                if name in seen or any(parent in links for parent in name.parents):
+                    raise RuntimeError('Duplicate archive member or link ancestor')
+                seen.add(name)
+                if not (m.isfile() or m.isdir() or m.issym() or m.islnk()):
+                    raise RuntimeError('Unexpected special file in VS Code archive')
+                if m.issym() or m.islnk():
+                    link = PurePosixPath(m.linkname)
+                    if link.is_absolute() or '\\' in m.linkname:
+                        raise RuntimeError('Absolute archive link')
+                    target = (dest / m.name).parent / m.linkname if m.issym() else dest / m.linkname
+                    if not target.resolve().is_relative_to(dest.resolve()):
+                        raise RuntimeError('Escaping archive link')
+                    relative = target.resolve().relative_to(dest.resolve())
+                    if any(link_path in relative.parents or
+                           link_path == relative for link_path in links):
+                        raise RuntimeError('Archive link chains are not supported')
+            # Never let archive links redirect writes, and strip setuid/setgid bits.
+            for m in members:
+                p = dest / m.name
+                if m.isdir():
+                    p.mkdir(parents=True, exist_ok=True)
+                elif m.isfile():
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    with t.extractfile(m) as src, p.open('xb') as dst:
+                        shutil.copyfileobj(src, dst)
+                    p.chmod(m.mode & 0o777)
+            for m in members:
+                p = dest / m.name
+                if m.issym() or m.islnk():
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    if m.issym():
+                        p.symlink_to(m.linkname)
+                    else:
+                        os.link(dest / m.linkname, p)
+
+def switch(link, target):
+    if link.exists() and not link.is_symlink():
+        raise RuntimeError(f'Refusing to replace non-symlink: {link}')
+    tmp = link.with_name('current.pending')
+    if tmp.exists() or tmp.is_symlink():
+        raise RuntimeError(f'Previous pending activation exists: {tmp}')
+    tmp.symlink_to(target)
+    os.replace(tmp, link)
+
+def install_app(root, app, version, url, sha, kind, work):
+    if not re.fullmatch(r'[0-9A-Za-z._-]+', version) or not re.fullmatch(r'[0-9a-fA-F]{64}', sha):
+        raise RuntimeError(f'Invalid version/checksum for {app}')
+    appdir = safe(root / 'apps' / app)
+    releases = safe(appdir / 'releases')
+    dest = safe(releases / version)
+    exe = 'brave' if app == 'brave' else 'bin/code'
+    releases.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        receipt = json.loads((dest / '.thin-client-install.json').read_text())
+        if receipt.get('sha256') != sha or not os.access(dest / exe, os.X_OK):
+            raise RuntimeError(f'Existing release is incomplete/unrecognized: {dest}')
+        print(f'Already installed: {dest}', flush=True)
+    else:
+        if shutil.disk_usage(root).free < 3 * 1024**3:
+            raise RuntimeError('Need at least 3 GiB free in goinfre for staged downloads')
+        archive = work / (app + ('.zip' if kind == 'zip' else '.tar.gz'))
+        fetch(url, archive)
+        verify_checksum(archive, sha)
+        print(f'Verified SHA-256: {app} {sha}', flush=True)
+        unpack = work / (app + '-unpacked')
+        unpack.mkdir(mode=0o700)
+        extract(archive, unpack, kind)
+        payload = unpack if app == 'brave' else unpack / 'VSCode-linux-x64'
+        if not os.access(payload / exe, os.X_OK):
+            raise RuntimeError(f'Missing executable in {app} archive')
+        (payload / '.thin-client-install.json').write_text(json.dumps({
+            'version': version, 'sha256': sha.lower(), 'url': url}, indent=2) + '\n')
+        payload.rename(dest)
+        print(f'Installed new release: {dest}', flush=True)
+    switch(appdir / 'current', dest)
+    # Prior releases/downloads are intentionally retained, never auto-cleaned.
+    print(f'Activated: {appdir / "current"} -> {dest}', flush=True)
+
+def install(root):
+    if os.uname().machine != 'x86_64':
+        raise RuntimeError('This release currently supports Linux x86_64 only')
+    # First installation cannot affect running Flatpak applications. Updates
+    # refuse activation until applications are stopped; old releases are retained.
+    if any((root / 'apps' / app / 'current').exists() for app in ['brave', 'vscode']):
+        stopped()
+    safe(root / 'tmp').mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix='download-', dir=root / 'tmp'))
+    print(f'Download staging (retained on success/failure): {work}', flush=True)
+    version = text_url('https://versions.brave.com/latest/release-linux-x64.version', work, 'brave-version')
+    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+        raise RuntimeError('Invalid Brave stable version')
+    # Protect existing profile from an accidental Brave version downgrade.
+    for profile in (OLD_BRAVE, BRAVE):
+        last = profile / 'Last Version'
+        if last.exists():
+            parts = last.read_text().strip().split('.')[-3:]
+            if tuple(map(int, version.split('.'))) < tuple(map(int, parts)):
+                raise RuntimeError('Latest downloaded Brave would downgrade an existing profile')
+    url = f'https://github.com/brave/brave-browser/releases/download/v{version}/brave-browser-{version}-linux-amd64.zip'
+    sha = text_url(url + '.sha256', work, 'brave-sha256').split()[0]
+    meta = json.loads(text_url('https://update.code.visualstudio.com/api/update/linux-x64/stable/latest', work, 'vscode-meta.json'))
+    install_app(root, 'brave', version, url, sha, 'zip', work)
+    install_app(root, 'vscode', meta['productVersion'], meta['url'], meta['sha256hash'], 'tar', work)
+
+def cache_link(path, target):
+    safe(target).mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        if path.resolve() != target.resolve():
+            raise RuntimeError(f'Unexpected cache link: {path}')
+    elif path.exists():
+        raise RuntimeError(f'Existing data blocks cache redirection (left intact): {path}')
+    else:
+        safe(path.parent).mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target)
+
+def caches(root):
+    # Only new, explicitly disposable paths are linked. Never relocate existing data.
+    for name in CODE_CACHES:
+        cache_link(CODE / name, root / 'cache/vscode' / name)
+    if BRAVE.is_dir():
+        for parent in [BRAVE, *[p for p in BRAVE.iterdir() if p.is_dir() and
+                       (p.name == 'Default' or p.name.startswith('Profile '))]]:
+            for name in sorted(CACHE_NAMES - {'BrowserMetrics-spare.pma', 'ScriptCache', 'CacheStorage'}):
+                cache_link(parent / name, root / 'cache/brave-profile' / parent.relative_to(BRAVE) / name)
+            if parent != BRAVE:
+                for name in ['ScriptCache', 'CacheStorage']:
+                    cache_link(parent / 'Service Worker' / name,
+                               root / 'cache/brave-profile' / parent.name / 'Service Worker' / name)
+
+def migrate(root):
+    stopped()
+    safe(BRAVE); safe(CODE)
+    if not (BRAVE / '.thin-client-import').exists():
+        if BRAVE.exists():
+            raise RuntimeError(f'Existing native Brave data left intact; manual review required: {BRAVE}')
+        stage = BRAVE.with_name('Brave-Browser.thin-client-partial')
+        if stage.exists():
+            raise RuntimeError(f'Incomplete migration exists; inspect before retry: {stage}')
+        if not OLD_BRAVE.exists():
+            BRAVE.mkdir(parents=True, mode=0o700)
+            (BRAVE / '.thin-client-import').write_text('New native profile; no Flatpak source found\n')
+            print('Prepared an empty native Brave profile; no source was copied', flush=True)
+        else:
+            migrate_brave(stage)
+    if not (CODE / '.thin-client-import').exists():
+        migrate_code()
+    caches(root)
+
+def migrate_brave(stage):
+    safe(OLD_BRAVE)
+    if not (OLD_BRAVE / 'Local State').is_file():
+        raise RuntimeError('Flatpak Brave source exists but lacks Local State')
+    excludes = [f'--exclude={n}' for n in sorted(CACHE_NAMES)]
+    excludes += ['--exclude=Singleton*', '--exclude=*.lock', '--exclude=*.sock',
+                 '--exclude=.org.chromium.*', '--exclude=.thin-client-import']
+    dry = run(['rsync', '-an', '--stats', *excludes, str(OLD_BRAVE) + '/', str(stage) + '/'],
+              capture_output=True, text=True)
+    size = int(re.search(r'Total file size: ([\d,]+) bytes', dry.stdout).group(1).replace(',', ''))
+    free = shutil.disk_usage(HOME).free
+    print(f'Brave copy: {OLD_BRAVE} -> {BRAVE}; bytes={size}; HOME free={free}', flush=True)
+    if free < size + 200 * 1024**2:
+        raise RuntimeError('Insufficient HOME space for profile copy plus 200 MiB reserve')
+    BRAVE.parent.mkdir(parents=True, exist_ok=True)
+    run(['rsync', '-a', *excludes, str(OLD_BRAVE) + '/', str(stage) + '/'])
+    # Check copied persistent files by content, not just time/size.
+    check = run(['rsync', '-anc', '--itemize-changes', *excludes,
+                 str(OLD_BRAVE) + '/', str(stage) + '/'], capture_output=True, text=True)
+    if check.stdout.strip():
+        raise RuntimeError('Profile copy changed/failed verification; partial copy retained')
+    stage.chmod(0o700)
+    (stage / '.thin-client-import').write_text(f'Copied from {OLD_BRAVE}\n')
+    stage.rename(BRAVE)
+    print('Brave persistent copy verified; Flatpak source untouched', flush=True)
+def migrate_code():
+    safe(OLD_CODE)
+    if CODE.exists():
+        raise RuntimeError(f'Existing Code-Thin data left intact: {CODE}')
+    stage = CODE.with_name('Code-Thin.partial')
+    if stage.exists():
+        raise RuntimeError(f'Incomplete VS Code migration exists: {stage}')
+    user = stage / 'User'
+    user.mkdir(parents=True, mode=0o700)
+    for name in ['settings.json', 'keybindings.json', 'tasks.json', 'snippets']:
+        source = OLD_CODE / name
+        if source.is_dir():
+            shutil.copytree(source, user / name, symlinks=True)
+        elif source.is_file():
+            shutil.copy2(source, user / name)
+    settings = user / 'settings.json'
+    if settings.exists():
+        original = settings.read_text()
+        data = parse_jsonc(original)
+        profiles = data.get('terminal.integrated.profiles.linux', {})
+        invalid = [k for k,v in profiles.items() if isinstance(v,dict) and
+                   Path(v.get('path','')).name in ['flatpak-spawn','host-spawn']]
+        if invalid:
+            shutil.copy2(settings, STATE / 'flatpak-vscode-settings.original.jsonc')
+            for k in invalid:
+                del profiles[k]
+            if not profiles:
+                data.pop('terminal.integrated.profiles.linux', None)
+            if data.get('terminal.integrated.defaultProfile.linux') in invalid:
+                data.pop('terminal.integrated.defaultProfile.linux', None)
+            settings.write_text(json.dumps(data, indent=2) + '\n')
+            print('Removed copied Flatpak-only terminal profile; original settings preserved', flush=True)
+    (stage / '.thin-client-import').write_text(f'Copied small preferences from {OLD_CODE}\n')
+    stage.chmod(0o700)
+    stage.rename(CODE)
+    print(f'VS Code small preferences: {OLD_CODE} -> {CODE / "User"}', flush=True)
+
+def environment(root, app):
+    env = dict(os.environ)
+    env['XDG_CONFIG_HOME'] = str(HOME / '.config')
+    env['XDG_CACHE_HOME'] = str(root / 'cache' / app)
+    env['TMPDIR'] = str(root / 'tmp')
+    for p in [root / 'cache' / app, root / 'tmp', root / 'vscode-extensions']:
+        safe(p).mkdir(parents=True, exist_ok=True)
+    return env
+
+def code_args(root):
+    return [root / 'apps/vscode/current/bin/code', '--user-data-dir', CODE,
+            '--extensions-dir', root / 'vscode-extensions']
+
+def integrate(root):
+    if not (CODE / '.thin-client-import').exists() or not (BRAVE / '.thin-client-import').exists():
+        raise RuntimeError('Complete migration before integration')
+    stopped()
+    caches(root)
+    env = environment(root, 'vscode')
+    for ext in EXTENSIONS:
+        run([*code_args(root), '--install-extension', ext], env=env)
+    print('Local extension inventory:', flush=True)
+    run([*code_args(root), '--list-extensions', '--show-versions'], env=env)
+    desktop_integration()
+
+def desktop_integration():
+    """Write launchers without installing extensions or requiring apps to quit."""
+    apps = HOME / '.local/share/applications'
+    safe(apps).mkdir(parents=True, exist_ok=True)
+    for app, title, command, icon, category in [
+        ('brave', 'Brave (native thin client)', 'brave-native', 'com.brave.Browser', 'Network;WebBrowser;'),
+        ('code', 'VS Code (native thin client)', 'code-native', 'com.visualstudio.code', 'Development;IDE;')]:
+        wrapper = HOME / '.local/bin' / command
+        contents = '#!/bin/sh\n# Managed by thin-client-setup\nexec ' + shlex.quote(str(SELF)) + ' open ' + app + ' "$@"\n'
+        managed_file(wrapper, contents, 0o755)
+        entry = apps / (command + '.desktop')
+        contents = ('[Desktop Entry]\n# Managed by thin-client-setup\nType=Application\n'
+                    f'Name={title}\nExec="{wrapper}" ' + ('%U' if app == 'brave' else '%F') + '\n'
+                    f'Icon={icon}\nCategories={category}\nStartupWMClass=' + ('brave-native' if app == 'brave' else 'code') + '\n')
+        if app == 'brave':
+            contents += 'MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;\n'
+        managed_file(entry, contents, 0o644)
+    wrapper = HOME / '.local/bin/code-native'
+    managed_file(apps / 'code-native-url-handler.desktop',
+                 '[Desktop Entry]\n# Managed by thin-client-setup\n'
+                 'Type=Application\nName=VS Code (native thin client) - URL Handler\n'
+                 f'Exec="{wrapper}" --open-url %U\n'
+                 'Icon=com.visualstudio.code\nNoDisplay=true\nStartupNotify=true\n'
+                 'Categories=Development;IDE;\nMimeType=x-scheme-handler/vscode;\n', 0o644)
+    if shutil.which('update-desktop-database'):
+        run(['update-desktop-database', apps])
+    run(['xdg-mime', 'default', 'code-native-url-handler.desktop', 'x-scheme-handler/vscode'])
+    print('Launchers installed; vscode URI handler registered; browser default and shell configuration unchanged', flush=True)
+
+def managed_file(path, contents, mode):
+    safe(path)
+    if path.exists() and '# Managed by thin-client-setup' not in path.read_text().splitlines():
+        raise RuntimeError(f'Refusing to overwrite unmanaged file: {path}')
+    if not path.exists() or path.read_text() != contents:
+        fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(contents)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        print(f'Wrote managed file: {path}', flush=True)
+
+def open_app(root, app, args):
+    if any(a.startswith(('--user-data-dir', '--extensions-dir', '--disk-cache-dir', '--disk-cache-size')) for a in args):
+        raise RuntimeError('Storage overrides belong in the reviewed setup, not launcher arguments')
+    exe = root / ('apps/brave/current/brave' if app == 'brave' else 'apps/vscode/current/bin/code')
+    if not os.access(exe, os.X_OK):
+        raise RuntimeError('Goinfre app missing: run ~/.local/bin/thin-client-setup prepare explicitly')
+    profile = BRAVE if app == 'brave' else CODE
+    if not (profile / '.thin-client-import').exists():
+        raise RuntimeError('Profile not prepared: run thin-client-setup migrate/integrate')
+    caches(root)
+    env = environment(root, app if app == 'brave' else 'vscode')
+    if app == 'brave':
+        argv = [exe, f'--user-data-dir={BRAVE}', '--class=brave-native', '--disk-cache-size=104857600', *args]
+    else:
+        argv = [*code_args(root), *args]
+    os.execve(exe, [str(a) for a in argv], env)
+
+def allocated(path):
+    if not path.exists():
+        return 0
+    r = run(['du', '-x', '-B1', '-s', '--', path], capture_output=True, text=True)
+    return int(r.stdout.split()[0])
+
+def audit():
+    """Only metadata: never dump profiles, settings, SSH config or auth contents."""
+    run(['df', '-h', HOME])
+    for path in [HOME / '.local', HOME / '.var', HOME / '.config',
+                 OLD_BRAVE.parent.parent.parent, OLD_CODE.parent.parent.parent,
+                 BRAVE, CODE]:
+        print(f'{path}: {allocated(path)} allocated bytes', flush=True)
+    try:
+        root = goinfre()
+        print(f'Validated disposable storage: {root.parent}', flush=True)
+        run(['df', '-h', root.parent])
+    except RuntimeError as error:
+        print(f'Goinfre unavailable: {error}', flush=True)
+    if shutil.which('flatpak'):
+        run(['flatpak', 'ps', '--columns=application'])
+    for scheme in ['http', 'https', 'vscode']:
+        if shutil.which('xdg-mime'):
+            r = run(['xdg-mime', 'query', 'default', f'x-scheme-handler/{scheme}'],
+                    capture_output=True, text=True)
+            print(f'{scheme} handler: {r.stdout.strip() or "unset"}', flush=True)
+
+def doctor():
+    audit()
+    tools = ['python3', 'curl', 'rsync', 'ps', 'du', 'df', 'xdg-mime', 'xdg-settings']
+    for tool in tools:
+        print(f'{tool}: {shutil.which(tool) or "MISSING"}', flush=True)
+    print('GPU device nodes: ' + ('present' if Path('/dev/dri').is_dir() else 'not visible'), flush=True)
+    print('Manual checks: brave://version, brave://gpu, WebGL/WebGL2 and your apps; '
+          'Code Remote SSH and GitHub sign-in. See README.', flush=True)
+
+def install_self():
+    source = Path(__file__).resolve()
+    if source == SELF.resolve():
+        return
+    safe(SELF.parent).mkdir(parents=True, exist_ok=True)
+    managed_file(SELF, source.read_text(), 0o755)
+
+def make_default_browser():
+    apps = HOME / '.local/share/applications'
+    for name in ['brave-native.desktop', 'code-native-url-handler.desktop']:
+        if not (apps / name).is_file():
+            raise RuntimeError('Run integrate/desktop before registering defaults')
+    run(['xdg-settings', 'set', 'default-web-browser', 'brave-native.desktop'])
+    for scheme in ['http', 'https']:
+        run(['xdg-mime', 'default', 'brave-native.desktop', f'x-scheme-handler/{scheme}'])
+    print('Explicit choice applied: native Brave is the HTTP/HTTPS default', flush=True)
+
+def flatpak_path(app):
+    if app not in APP_IDS:
+        raise RuntimeError('Only brave or vscode may be retired by this tool')
+    path = HOME / '.var/app' / APP_IDS[app]
+    safe(path)
+    if path.parent != HOME / '.var/app':
+        raise RuntimeError('Invalid Flatpak retirement path')
+    return path
+
+def backup_flatpak(app, source, root):
+    directory = safe(root / 'legacy-backups')
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = Path(tempfile.mkdtemp(prefix=f'{app}-{time.strftime("%Y%m%d-%H%M%S")}-', dir=directory))
+    if app == 'brave':
+        source = source / 'config/BraveSoftware/Brave-Browser'
+        if not (source / 'Local State').is_file():
+            raise RuntimeError('Cannot back up incomplete Brave profile')
+    else:
+        source = source / 'config/Code/User'
+        if not source.is_dir():
+            raise RuntimeError('Cannot back up missing VS Code User directory')
+    safe(source)
+    excludes = [f'--exclude={n}' for n in sorted(CACHE_NAMES | {'logs', 'Shared Dictionary'})]
+    excludes += ['--exclude=Singleton*', '--exclude=*.lock', '--exclude=*.sock',
+                 '--exclude=.org.chromium.*', '--exclude=CrashpadMetrics*', '--exclude=/Safe Browsing']
+    payload = destination / 'persistent-data'
+    run(['rsync', '-a', *excludes, str(source) + '/', str(payload) + '/'])
+    verify = run(['rsync', '-anc', '--itemize-changes', *excludes,
+                  str(source) + '/', str(payload) + '/'], capture_output=True, text=True)
+    if verify.stdout.strip():
+        raise RuntimeError('Backup verification failed; old data was not deleted')
+    rows = []
+    for path in sorted(payload.rglob('*')):
+        if path.is_symlink():
+            original = source / path.relative_to(payload)
+            if os.readlink(path) != os.readlink(original):
+                raise RuntimeError('Backup link mismatch')
+            data = os.readlink(path).encode()
+            rows.append({'source': str(original), 'backup': str(path), 'type': 'symlink',
+                         'sha256': hashlib.sha256(data).hexdigest(), 'size': path.lstat().st_size})
+        elif path.is_file():
+            original = source / path.relative_to(payload)
+            checksum = digest(original)
+            if checksum != digest(path):
+                raise RuntimeError('Backup checksum mismatch')
+            rows.append({'source': str(original), 'backup': str(path), 'type': 'file',
+                         'sha256': checksum, 'size': path.stat().st_size})
+    (destination / 'manifest.json').write_text(json.dumps(rows, indent=2) + '\n')
+    print(f'Verified temporary backup: {destination}; {allocated(destination)} bytes', flush=True)
+    return destination
+
+def retire_flatpak(root, app, *, dry_run=False, verified=False, yes=False, backup=True):
+    path = flatpak_path(app)
+    print(f'Exact retirement path: {path}; {allocated(path)} allocated bytes', flush=True)
+    if dry_run:
+        print(f'DRY RUN: would check stopped apps/replacement/verification, '
+              f'{"back up persistent data, " if backup else ""}then remove only {path}', flush=True)
+        return
+    if not verified:
+        raise RuntimeError('Manual replacement verification required: pass --verified after GUI checks')
+    profile = BRAVE if app == 'brave' else CODE
+    executable = root / ('apps/brave/current/brave' if app == 'brave' else 'apps/vscode/current/bin/code')
+    if not (profile / '.thin-client-import').is_file() or not os.access(executable, os.X_OK):
+        raise RuntimeError('Native replacement/profile is not ready')
+    safe(profile)
+    stopped((app,))
+    schemes = ['http', 'https'] if app == 'brave' else ['vscode']
+    expected = 'brave-native.desktop' if app == 'brave' else 'code-native-url-handler.desktop'
+    for scheme in schemes:
+        selected = run(['xdg-mime', 'query', 'default', f'x-scheme-handler/{scheme}'],
+                       capture_output=True, text=True).stdout.strip()
+        if selected != expected:
+            raise RuntimeError(f'{scheme} still points elsewhere; review native handler integration first')
+    if not path.is_dir():
+        raise RuntimeError('Retirement directory is missing; nothing deleted')
+    if not yes:
+        if not sys.stdin.isatty() or input(f'Type {APP_IDS[app]} to remove the exact directory: ') != APP_IDS[app]:
+            raise RuntimeError('Retirement not confirmed')
+    if backup:
+        backup_flatpak(app, path, root)
+    stopped((app,))
+    flatpak_path(app)  # Check again immediately before removing only this tree.
+    print(f'Removing ONLY {path}', flush=True)
+    shutil.rmtree(path)
+
+def cli_parser():
+    parser = argparse.ArgumentParser(description='Native Brave + VS Code thin client; no HOME binary fallback')
+    subs = parser.add_subparsers(dest='command', required=True)
+    for command in ['audit', 'doctor', 'status', 'install', 'migrate', 'integrate', 'desktop', 'prepare', 'browser-default']:
+        sub = subs.add_parser(command)
+        sub.add_argument('--dry-run', action='store_true')
+        if command in ['integrate', 'prepare']:
+            sub.add_argument('--make-default-browser', action='store_true', help='Explicit consent to native HTTP/HTTPS defaults')
+    sub = subs.add_parser('open')
+    sub.add_argument('app', choices=['brave', 'code'])
+    sub.add_argument('args', nargs=argparse.REMAINDER)
+    sub = subs.add_parser('retire-flatpak')
+    sub.add_argument('app', choices=sorted(APP_IDS))
+    sub.add_argument('--dry-run', action='store_true')
+    sub.add_argument('--verified', action='store_true', help='Confirm you completed manual GUI checks')
+    sub.add_argument('--yes', action='store_true', help='Explicitly confirm removal of the displayed app directory')
+    sub.add_argument('--no-backup', action='store_true', help='Explicitly skip the temporary persistent-data backup')
+    return parser
+
+def main(argv=None):
+    options = cli_parser().parse_args(argv)
+    command = options.command
+    if command in ['audit', 'doctor']:
+        (audit if command == 'audit' else doctor)()
+        return
+    root = goinfre()
+    print(f'Goinfre: {root}\nBrave persistent profile: {BRAVE}\nVS Code persistent state: {CODE}', flush=True)
+    if command == 'status':
+        for p in [root / 'apps/brave/current', root / 'apps/vscode/current', BRAVE, CODE, root / 'vscode-extensions']:
+            print(p, 'present' if p.exists() else 'missing')
+        return
+    if getattr(options, 'dry_run', False):
+        if command == 'retire-flatpak':
+            retire_flatpak(root, options.app, dry_run=True, backup=not options.no_backup)
+        else:
+            print(f'DRY RUN: {command}; no files, locks, downloads or handlers changed')
+        return
+    if command == 'open':
+        open_app(root, options.app, options.args)
+        return
+    os.umask(0o077)
+    safe(STATE).mkdir(parents=True, exist_ok=True)
+    with (STATE / 'setup.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        safe(root).mkdir(parents=True, exist_ok=True)
+        if command in ['install', 'integrate', 'desktop', 'prepare']:
+            install_self()
+        if command in ['install', 'prepare']:
+            install(root)
+        if command in ['migrate', 'prepare']:
+            migrate(root)
+        if command in ['integrate', 'prepare']:
+            integrate(root)
+        if command == 'desktop':
+            desktop_integration()
+        if command == 'browser-default' or getattr(options, 'make_default_browser', False):
+            make_default_browser()
+        if command == 'retire-flatpak':
+            retire_flatpak(root, options.app, verified=options.verified, yes=options.yes,
+                           backup=not options.no_backup)
+    print('Requested step complete.', flush=True)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError, zipfile.BadZipFile, tarfile.TarError) as e:
+        print(f'STOPPED: {e}', file=sys.stderr)
+        sys.exit(1)

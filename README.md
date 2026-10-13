@@ -36,6 +36,25 @@ Goinfre can disappear at any time. Keep your repository on a persistent Git
 remote and important personal data in HOME or another durable backup. Goinfre
 legacy backups are temporary fallbacks, not durable backups.
 
+## Moving to another 1337 post
+
+**HOME persists; goinfre is local to each workstation.** Your Brave profile,
+Code-Thin state, SSH files and installed wrappers can survive while app binaries,
+extensions and cache targets disappear. After quitting applications, restore them
+explicitly from a normal host terminal:
+
+```sh
+~/.local/bin/thin-client-setup status
+~/.local/bin/thin-client-setup prepare
+```
+
+Status reports **New/unprepared workstation detected** when app executables are
+missing. Clicking a launcher never downloads anything. Preparation recreates
+missing cache targets behind existing correct links and restores applications
+and extensions; it preserves prepared profiles. If goinfre itself is unavailable,
+locate the school's account-owned storage first. Detection prefers `~/goinfre`
+when no explicit `GOINFRE` override is set; no username is hardcoded.
+
 ## Requirements
 
 - Linux x86_64; Python 3.10+ from the system (stdlib only; no pip installation).
@@ -163,20 +182,54 @@ The normal Code desktop entry opens files with `%F`. A separate hidden
 and registers **only `x-scheme-handler/vscode`**. This routes browser callbacks
 for GitHub authentication/Settings Sync to Code-Thin instead of Flatpak Code.
 
-Browser defaults are changed **only on explicit request**:
+Browser defaults are changed **only on explicit request**. For this project's
+native deployment, select Brave explicitly:
 
 ```sh
-~/.local/bin/thin-client-setup browser-default
+~/.local/bin/thin-client-setup defaults brave
 # Or explicit consent during preparation:
 ./thin-client-setup prepare --make-default-browser
 ```
 
-This selects native Brave as the browser and HTTP/HTTPS handler. To refresh menu
+`defaults brave` installs/refreshes the managed launchers and entries, sets and
+queries the browser/URI defaults, and refuses to report success if they disagree.
+It is idempotent. `browser-default` remains available for compatibility and
+requires entries to have been installed already. Plain `prepare` and `desktop`
+do not take over HTTP/HTTPS defaults. To refresh menu
 entries and the Code callback handler without downloads or extension installs:
 
 ```sh
 ~/.local/bin/thin-client-setup desktop
 ```
+
+The supported external authentication route is:
+
+```text
+native Code -> HTTPS authorization page -> native Brave
+native Brave -> vscode:// callback -> code-native-url-handler.desktop
+             -> code-native --open-url <callback> -> Code-Thin
+```
+
+The normal `code-native.desktop` entry remains a file/folder launcher using `%F`.
+Only the dedicated callback entry registers `x-scheme-handler/vscode`, with
+`--open-url %U`. External HTTP/HTTPS URLs use `brave-native.desktop`, and
+`xdg-settings get default-web-browser` must return that same entry.
+
+Electron opens external URLs through the desktop's default applications;
+[VS Code's URI integration](https://code.visualstudio.com/api/advanced-topics/remote-extensions#callbacks-and-uri-handlers)
+supports native OAuth callbacks. Native Code drops an inherited `BROWSER`
+variable from its own environment because `xdg-open`'s generic fallback can use
+it. No browser executable is forced, and shell/Brave environments are unchanged.
+Managed setup queries and app launches use HOME's `.config` and `.local/share`
+for XDG configuration and desktop entries.
+
+Run `thin-client-setup status` or `doctor` to see the actual default browser,
+HTTP, HTTPS and vscode handlers alongside expected entries and clear mismatches.
+Diagnostics only query; they do not authenticate or change associations. Fully
+quit native Code before retesting so an existing process cannot retain a stale
+environment. Check GitHub sign-in, Settings Sync and an ordinary external link
+manually in the graphical session. Tests intercept XDG operations and callbacks;
+they do not perform live OAuth or prove keyring/network/provider behavior.
 
 ## Cache policy
 
@@ -208,11 +261,10 @@ existing directories/files and unexpected links are preserved and refused.
 Persistent site databases and nested directories with cache-like names do not
 qualify. Full `migrate`, `integrate`, and `prepare` still prepare both apps.
 
-After updating a reviewed checkout, `./thin-client-setup desktop` updates the
-installed setup script and launchers without downloads or profile migration.
-Existing prepared users need no additional migration command: Code launches
-independently immediately, and the next Brave launch redirects the allowlisted
-existing caches if Brave is stopped.
+Existing prepared users need no additional profile migration for this cache fix:
+after updating the installed setup script, Code launches independently and the
+next Brave launch redirects allowlisted existing caches if Brave is stopped.
+Profile or nested-cache mount points are refused as well as symlink ancestors.
 
 Prior application releases and downloads are retained for rollback. Audit their
 space periodically; this tool does not silently prune them.
@@ -266,6 +318,51 @@ contain personal paths; never commit them to this repository.
 
 ## Updates, failures and rollback
 
+**`git pull` updates the checkout, not `~/.local/bin/thin-client-setup`.** Both
+native wrappers execute that installed script. Upgrade from a reviewed checkout:
+
+```sh
+cd ~/goinfre/projects/1337-thin-client
+git pull
+./thin-client-setup status
+./thin-client-setup install-self
+sha256sum ./thin-client-setup ~/.local/bin/thin-client-setup
+./thin-client-setup status
+# Refresh managed desktop entries and the Code callback, without downloads:
+~/.local/bin/thin-client-setup desktop
+# Explicit native browser choice:
+~/.local/bin/thin-client-setup defaults brave
+```
+
+`install-self` copies only the reviewed script, using the existing managed-file
+marker, atomic replacement, executable permissions and a post-copy hash check.
+It refuses unmanaged files and symlink destinations. It works before goinfre apps
+are prepared, changes no desktop associations, and is idempotent. `desktop` still
+updates the script when invoked from the checkout, but the explicit command makes
+that requirement clear. An installed script cannot discover every checkout;
+run **the checkout's** `./thin-client-setup status` after pulling. It reports the
+executing release, checkout HEAD, both SHA-256 hashes and `UPDATE REQUIRED` on a
+mismatch. SHA-256 includes uncommitted edits; checkout HEAD alone does not.
+
+For a friend's remaining DawnGraphiteCache error, collect these read-only facts
+before concluding that a current implementation failed:
+
+```sh
+git rev-parse HEAD
+sha256sum ./thin-client-setup ~/.local/bin/thin-client-setup
+rg -n 'def brave_caches|def vscode_caches|DawnGraphiteCache|cache-backups|Existing data blocks' \
+  ./thin-client-setup ~/.local/bin/thin-client-setup
+ls -ld ~/.config/BraveSoftware/Brave-Browser/Default/DawnGraphiteCache
+```
+
+Different hashes indicate different code. The exact error alone cannot prove
+which code ran. Current code relocates a stopped browser's normal directory at
+that exact location, before generic link setup. A running Brave process produces
+a quit-app error; invalid goinfre, mounts, files, and unexpected links produce
+safe refusals. It never backs up these caches into HOME. Do not delete the cache
+blindly; update the installed script, fully quit Brave (including background
+processes), then retry `~/.local/bin/brave-native`.
+
 Run `prepare` again after quitting applications. Official version metadata is
 retrieved over HTTPS; downloads must match vendor SHA-256. Checksums trust the
 vendor HTTPS metadata, not an independent signed release provenance chain.
@@ -283,6 +380,55 @@ upgraded by a newer browser.** Restore a separate compatible profile copy instea
 Temporary legacy backups are reference/recovery copies, not database fragments
 to merge into an active profile. Before retirement, old Flatpak launchers remain
 an independent fallback; new native changes are not synced back to them.
+
+## Optional Codex storage: investigation and safe alternatives
+
+The requested automatic persistent-state/disposable-package split is **deferred**.
+This release adds a read-only storage diagnostic, without executing Codex:
+
+```sh
+~/.local/bin/thin-client-setup codex status
+```
+
+`codex install` and `codex prepare` deliberately refuse without downloading,
+moving data or creating wrappers. Normal Brave/Code preparation never installs
+Codex. Existing Codex installations, auth, config and databases remain untouched.
+
+Current [official environment-variable documentation](https://learn.chatgpt.com/docs/config-file/environment-variables)
+defines `CODEX_HOME` as the entire Codex state root, including config, auth,
+sessions, logs, skills and standalone package metadata. It must already exist.
+`CODEX_INSTALL_DIR` changes the visible command location; standalone packages
+still live under `CODEX_HOME/packages/standalone`. These are separate concerns.
+The local 0.161.0 layout is not a portable specification of future releases.
+
+| Category | Persistence decision |
+| --- | --- |
+| Standalone executables and app-server packages | Reproducible payloads; no independent root for all managed packages was established in current official configuration |
+| Downloads, generated caches and plugin package resources | Often reproducible, but not a supported single disposable subtree |
+| Config and authentication | Persistent/sensitive; credentials may use files or the OS keyring |
+| Sessions, history and SQLite-backed runtime state | User state; never blindly moved or marked disposable |
+| User skills and plugin configuration | May be user-authored/persistent; plugin resources can mix reproducible and user state |
+
+The [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+documents `sqlite_home` and `log_dir`, but they do not supply a root for all heavy
+packages. No selective package/daemon/plugin symlink scheme is implemented:
+its safety across installers, self-updates and new posts has not been established.
+The diagnostic reports presence of known paths only; it never prints auth/config
+contents or opens databases.
+
+Supported alternatives have explicit tradeoffs:
+
+- Keep the normal persistent `CODEX_HOME` in HOME, with an independently installed
+  CLI executable/package in goinfre. This moves that executable only and does not
+  guarantee that managed daemon/plugin packages or sessions stop growing in HOME.
+- Put an independent **whole** `CODEX_HOME` in detected goinfre. This reduces HOME
+  usage but makes auth, config, sessions, skills and packages disposable together.
+  A new post needs a new install and login; it does not meet the requested
+  persistent-state requirement. The repo does not silently select this mode.
+- Run Codex on a persistent remote machine, using local native Code over SSH.
+
+Until a supported full split is established, this repository does not promise
+both a tiny local Codex HOME and workstation-independent persistent Codex state.
 
 ## Troubleshooting
 
@@ -308,7 +454,12 @@ python3 -B -m unittest discover -s tests -v
 
 Tests use temporary fixtures/mocks, never real profiles. They cover traversal and
 link rejection, checksums, goinfre validation, cache/launcher safety, exact
-retirement paths, JSONC, fresh accounts and read-only dry runs.
+retirement paths, JSONC, fresh accounts and read-only dry runs. Release tests run
+the real self-install command in a temporary HOME, load that installed copy for
+the friend's Brave-cache scenario, exercise the generated callback wrapper, and
+simulate XDG defaults, cross-filesystem backups and empty-post recovery. External
+auth and Codex installers are not executed. Development never applies setup to
+the developer's live HOME.
 
 Do not add real profiles, audit dumps, auth files, SSH material or legacy backups.
 The repository ignores common generated/personal artifacts. Review every staged

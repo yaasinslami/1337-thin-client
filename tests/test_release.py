@@ -1,0 +1,355 @@
+"""Release checks: temporary accounts only; no live installers or desktop actions."""
+import contextlib
+import io
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import unittest
+from unittest import mock
+
+import test_safety as fixtures
+
+
+tool = fixtures.tool
+
+
+class ReleaseTests(unittest.TestCase):
+    setUp = fixtures.SafetyTests.setUp
+    fake_mount = fixtures.SafetyTests.fake_mount
+    native_fixture = fixtures.SafetyTests.native_fixture
+
+    def xdg_mock(self, *, ignore_https=False):
+        state = {'browser': 'other.desktop', 'http': 'other.desktop',
+                 'https': 'other.desktop', 'vscode': 'flatpak-code.desktop'}
+        calls = []
+        def execute(args, **kwargs):
+            argv = [str(arg) for arg in args]
+            calls.append(argv)
+            self.assertEqual(kwargs['env']['XDG_CONFIG_HOME'], str(self.home / '.config'))
+            self.assertEqual(kwargs['env']['XDG_DATA_HOME'], str(self.home / '.local/share'))
+            if argv[:3] == ['xdg-settings', 'get', 'default-web-browser']:
+                return mock.Mock(stdout=state['browser'] + '\n')
+            if argv[:3] == ['xdg-settings', 'set', 'default-web-browser']:
+                state['browser'] = argv[3]
+            elif argv[:3] == ['xdg-mime', 'query', 'default']:
+                return mock.Mock(stdout=state[argv[3].split('/')[-1]] + '\n')
+            elif argv[:2] == ['xdg-mime', 'default']:
+                scheme = argv[3].split('/')[-1]
+                if not (ignore_https and scheme == 'https'):
+                    state[scheme] = argv[2]
+            elif argv[0] != 'update-desktop-database':
+                self.fail(f'Unexpected external command: {argv}')
+            return mock.Mock(stdout='')
+        return state, calls, execute
+
+    def test_explicit_defaults_register_all_routes_idempotently(self):
+        state, calls, execute = self.xdg_mock()
+        with mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'run', side_effect=execute):
+            tool.main(['defaults', 'brave'])
+            entries = self.home / '.local/share/applications'
+            before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in entries.iterdir()}
+            tool.main(['defaults', 'brave'])
+            self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                                     for p in entries.iterdir()})
+        self.assertEqual(state, {'browser': 'brave-native.desktop', 'http': 'brave-native.desktop',
+                                'https': 'brave-native.desktop', 'vscode': 'code-native-url-handler.desktop'})
+        callback = (entries / 'code-native-url-handler.desktop').read_text()
+        self.assertIn('--open-url %U', callback)
+        self.assertIn('MimeType=x-scheme-handler/vscode;', callback)
+        self.assertNotIn('x-scheme-handler/http', callback)
+        self.assertNotIn('x-scheme-handler/vscode', (entries / 'code-native.desktop').read_text())
+        self.assertIn(['xdg-settings', 'get', 'default-web-browser'], calls)
+
+    def test_desktop_does_not_take_over_browser_defaults(self):
+        state, _, execute = self.xdg_mock()
+        with mock.patch.object(tool, 'run', side_effect=execute):
+            tool.desktop_integration()
+        self.assertEqual(state['browser'], 'other.desktop')
+        self.assertEqual(state['http'], 'other.desktop')
+        self.assertEqual(state['https'], 'other.desktop')
+        self.assertEqual(state['vscode'], 'code-native-url-handler.desktop')
+
+    def test_defaults_refuse_to_report_success_when_xdg_ignores_update(self):
+        _, _, execute = self.xdg_mock(ignore_https=True)
+        with mock.patch.object(tool, 'run', side_effect=execute):
+            tool.desktop_integration()
+            with self.assertRaisesRegex(RuntimeError, 'did not match'):
+                tool.make_default_browser()
+
+    def test_diagnostics_are_read_only_and_report_mismatches(self):
+        state, calls, execute = self.xdg_mock()
+        expected = dict(state)
+        output = io.StringIO()
+        with mock.patch.object(tool, 'run', side_effect=execute), contextlib.redirect_stdout(output):
+            self.assertFalse(tool.desktop_diagnostics())
+        self.assertEqual(state, expected)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(output.getvalue().count('MISMATCH'), 4)
+        self.assertIn('MISSING', output.getvalue())
+        self.assertFalse((self.home / '.config').exists())
+
+    def test_diagnostics_report_query_failures(self):
+        with mock.patch.object(tool, 'run', side_effect=FileNotFoundError('fixture')), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(tool.desktop_diagnostics())
+        self.assertIn('unavailable (query failed)', output.getvalue())
+
+    def test_code_callback_args_and_browser_environment_preserved_correctly(self):
+        exe = self.native_fixture('code')
+        callback = 'vscode://vscode.github-authentication/did-authenticate?code=fixture&state=fixture'
+        with mock.patch.dict(os.environ, {'BROWSER': '/stale/browser'}), \
+             mock.patch.object(tool.os, 'execve') as execute:
+            tool.open_app(self.root, 'code', ['--open-url', callback])
+            path, argv, env = execute.call_args.args
+            self.assertEqual(path, exe)
+            self.assertEqual(argv[-2:], ['--open-url', callback])
+            self.assertIn(str(tool.CODE), argv)
+            self.assertNotIn('BROWSER', env)
+            self.assertEqual(os.environ['BROWSER'], '/stale/browser')
+            brave_env = tool.environment(self.root, 'brave')
+            self.assertEqual(brave_env['BROWSER'], '/stale/browser')
+
+    def test_friend_brave_launch_relocates_cache_before_exec(self):
+        exe = self.native_fixture('brave')
+        path = tool.BRAVE / 'Default/DawnGraphiteCache'
+        path.mkdir(parents=True)
+        (path / 'generated').write_text('friend cache fixture')
+        with self.fake_mount(), mock.patch.object(tool, 'stopped') as stopped, \
+             mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(tool.os, 'execve') as execute:
+            tool.main(['open', 'brave'])
+            stopped.assert_called_once_with(('brave',))
+            execute.assert_called_once()
+            self.assertEqual(execute.call_args.args[0], exe)
+        self.assertEqual(path.resolve(), self.root / 'cache/brave-profile/Default/DawnGraphiteCache')
+        backups = list((self.root / 'cache-backups').glob('*/DawnGraphiteCache/generated'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), 'friend cache fixture')
+        self.assertFalse((tool.STATE / 'cache-backups').exists())
+
+    def test_profile_number_cache_relocation_and_launch_idempotent(self):
+        self.native_fixture('brave')
+        for profile in ['Profile 1', 'Profile 12']:
+            path = tool.BRAVE / profile / 'DawnGraphiteCache'
+            path.mkdir(parents=True)
+            (path / 'generated').write_text(profile)
+        with self.fake_mount(), mock.patch.object(tool, 'stopped'), mock.patch.object(tool.os, 'execve'):
+            tool.open_app(self.root, 'brave', [])
+            tool.open_app(self.root, 'brave', [])
+        self.assertEqual({p.read_text() for p in (self.root / 'cache-backups').glob('*/*/generated')},
+                         {'Profile 1', 'Profile 12'})
+
+    def test_running_brave_blocks_open_without_losing_contents(self):
+        self.native_fixture('brave')
+        path = tool.BRAVE / 'Default/DawnGraphiteCache'
+        path.mkdir(parents=True)
+        (path / 'generated').write_text('keep')
+        with self.fake_mount(), mock.patch.object(tool, 'stopped', side_effect=RuntimeError('Quit Brave')), \
+             mock.patch.object(tool.os, 'execve') as execute:
+            with self.assertRaisesRegex(RuntimeError, 'Quit Brave'):
+                tool.open_app(self.root, 'brave', [])
+            execute.assert_not_called()
+        self.assertEqual((path / 'generated').read_text(), 'keep')
+        self.assertFalse(path.is_symlink())
+
+    def test_unknown_cache_directory_and_wrong_link_refuse_actual_brave_open(self):
+        self.native_fixture('brave')
+        path = tool.BRAVE / 'Default/DawnWebGPUCache'  # deliberately outside relocation allowlist
+        path.mkdir(parents=True)
+        (path / 'generated').write_text('keep')
+        with mock.patch.object(tool.os, 'execve') as execute:
+            with self.assertRaisesRegex(RuntimeError, 'left intact'):
+                tool.open_app(self.root, 'brave', [])
+            execute.assert_not_called()
+        self.assertEqual((path / 'generated').read_text(), 'keep')
+        # Remove only the fixture to test an unexpected link at the same location.
+        shutil.rmtree(path)
+        path.symlink_to(self.base / 'unexpected')
+        with mock.patch.object(tool.os, 'execve') as execute:
+            with self.assertRaisesRegex(RuntimeError, 'Unexpected cache link'):
+                tool.open_app(self.root, 'brave', [])
+            execute.assert_not_called()
+        self.assertEqual(os.readlink(path), str(self.base / 'unexpected'))
+
+    def test_new_post_refuses_download_on_launch_and_prepare_restores_targets(self):
+        with mock.patch.object(tool, 'stopped'), mock.patch.object(tool.os, 'execve'):
+            self.native_fixture('brave')
+            self.native_fixture('code')
+            tool.open_app(self.root, 'brave', [])
+            tool.open_app(self.root, 'code', [])
+        shutil.rmtree(self.root)  # only disposable fixture storage
+        with mock.patch.object(tool, 'install') as install:
+            with self.assertRaisesRegex(RuntimeError, 'prepare explicitly'):
+                tool.open_app(self.root, 'brave', [])
+            install.assert_not_called()
+        def restore_binaries(root):
+            self.native_fixture('brave')
+            self.native_fixture('code')
+        with mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'stopped'), \
+             mock.patch.object(tool, 'install', side_effect=restore_binaries), \
+             mock.patch.object(tool, 'run'), mock.patch.object(tool, 'desktop_integration'):
+            tool.main(['prepare'])
+        self.assertTrue((tool.BRAVE / 'GPUCache').is_dir())
+        self.assertTrue((tool.CODE / 'GPUCache').is_dir())
+        self.assertTrue((self.root / 'vscode-extensions').is_dir())
+
+    def test_mount_escape_in_profile_or_inside_cache_is_refused(self):
+        path = tool.BRAVE / 'Default/DawnGraphiteCache'
+        path.mkdir(parents=True)
+        nested = path / 'nested'
+        nested.mkdir()
+        (nested / 'generated').write_text('keep')
+        for mount in [path.parent, nested]:
+            with self.subTest(mount=mount), self.fake_mount(), \
+                 mock.patch.object(tool, 'stopped'), \
+                 mock.patch.object(Path, 'is_mount', autospec=True, side_effect=lambda p: p == mount):
+                with self.assertRaisesRegex(RuntimeError, 'Mount'):
+                    tool.brave_cache_link(path, self.root / 'cache/test', self.root)
+            self.assertEqual((nested / 'generated').read_text(), 'keep')
+
+    def test_status_detects_new_post_without_mutation(self):
+        before = sorted(self.base.rglob('*'))
+        with mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(tool, 'script_status'), mock.patch.object(tool, 'desktop_diagnostics'), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            tool.main(['status'])
+        self.assertIn('New/unprepared workstation detected', output.getvalue())
+        self.assertIn('thin-client-setup prepare', output.getvalue())
+        self.assertEqual(before, sorted(self.base.rglob('*')))
+
+    def test_repo_vs_stale_installed_script_warning_then_exact_update(self):
+        tool.SELF.parent.mkdir(parents=True)
+        tool.SELF.write_text('#!/usr/bin/env python3\n# Managed by thin-client-setup\n# old fixture\n')
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            tool.script_status()
+        self.assertIn('UPDATE REQUIRED', output.getvalue())
+        with mock.patch.object(tool, 'goinfre', side_effect=AssertionError('install-self needs no goinfre')):
+            tool.main(['install-self'])
+        self.assertEqual(tool.SELF.read_bytes(), fixtures.SCRIPT.read_bytes())
+        self.assertEqual(tool.SELF.stat().st_mode & 0o777, 0o755)
+        timestamp = tool.SELF.stat().st_mtime_ns
+        tool.main(['install-self'])
+        self.assertEqual(tool.SELF.stat().st_mtime_ns, timestamp)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            tool.script_status()
+        self.assertNotIn('UPDATE REQUIRED', output.getvalue())
+        self.assertIn('matches', output.getvalue())
+
+    def test_install_self_dry_run_does_not_modify_files(self):
+        before = sorted(self.base.rglob('*'))
+        with mock.patch.object(tool, 'goinfre', side_effect=AssertionError('unexpected')):
+            tool.main(['install-self', '--dry-run'])
+        self.assertEqual(before, sorted(self.base.rglob('*')))
+
+    def test_install_self_repairs_executable_mode_without_changing_bytes(self):
+        tool.main(['install-self'])
+        expected = tool.SELF.read_bytes()
+        tool.SELF.chmod(0o600)
+        tool.main(['install-self'])
+        self.assertEqual(tool.SELF.read_bytes(), expected)
+        self.assertEqual(tool.SELF.stat().st_mode & 0o777, 0o755)
+
+    def test_install_self_symlink_to_checkout_refused(self):
+        tool.SELF.parent.mkdir(parents=True)
+        tool.SELF.symlink_to(fixtures.SCRIPT)
+        with self.assertRaisesRegex(RuntimeError, 'Unexpected symlink'):
+            tool.main(['install-self'])
+        self.assertTrue(tool.SELF.is_symlink())
+
+    def test_home_goinfre_link_selects_generic_validated_storage(self):
+        (self.home / 'goinfre').symlink_to(self.root.parent)
+        with self.fake_mount(), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(tool.goinfre(), self.root)
+
+    def test_actual_cli_install_self_updates_temporary_account_only(self):
+        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'}
+        tool.SELF.parent.mkdir(parents=True)
+        tool.SELF.write_text('# Managed by thin-client-setup\n# old fixture\n')
+        result = subprocess.run([sys.executable, '-B', str(fixtures.SCRIPT), 'install-self'],
+                                env=env, capture_output=True, text=True, check=True)
+        self.assertIn('Installed setup', result.stdout)
+        self.assertEqual(tool.SELF.read_bytes(), fixtures.SCRIPT.read_bytes())
+        result = subprocess.run([sys.executable, '-B', str(tool.SELF), '--version'],
+                                env=env, capture_output=True, text=True, check=True)
+        self.assertIn(tool.VERSION, result.stdout)
+        self.assertFalse((self.home / '.config').exists())
+        self.assertFalse((self.root / 'apps').exists())
+
+    def test_upgraded_installed_copy_handles_friend_cache_scenario(self):
+        tool.SELF.parent.mkdir(parents=True)
+        tool.SELF.write_text('# Managed by thin-client-setup\n# old fixture\n')
+        tool.main(['install-self'])
+        with mock.patch.dict(os.environ, {'HOME': str(self.home)}):
+            loader = importlib.machinery.SourceFileLoader('installed_fixture', str(tool.SELF))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            installed = importlib.util.module_from_spec(spec)
+            loader.exec_module(installed)
+        self.native_fixture('brave')
+        path = installed.BRAVE / 'Default/DawnGraphiteCache'
+        path.mkdir(parents=True)
+        (path / 'generated').write_text('upgraded fixture')
+        with self.fake_mount(), mock.patch.object(installed, 'goinfre', return_value=self.root), \
+             mock.patch.object(installed, 'stopped'), mock.patch.object(installed.os, 'execve') as execute:
+            installed.main(['open', 'brave'])
+            execute.assert_called_once()
+        self.assertTrue(path.is_symlink())
+        backup = next((self.root / 'cache-backups').glob('*/DawnGraphiteCache/generated'))
+        self.assertEqual(backup.read_text(), 'upgraded fixture')
+        self.assertFalse((installed.STATE / 'cache-backups').exists())
+
+    def test_generated_callback_wrapper_preserves_url_as_one_argument(self):
+        with mock.patch.object(tool, 'run'):
+            tool.desktop_integration()
+        # A recording setup fixture intercepts the generated launcher's exec.
+        tool.SELF.write_text('#!/usr/bin/python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+        tool.SELF.chmod(0o755)
+        callback = 'vscode://fixture/callback?code=fixture&state=fixture'
+        result = subprocess.run(['/bin/sh', str(self.home / '.local/bin/code-native'),
+                                 '--open-url', callback],
+                                env={'HOME': str(self.home), 'PATH': '/usr/bin:/bin'},
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), ['open', 'code', '--open-url', callback])
+
+    def test_unmanaged_installed_script_never_overwritten(self):
+        tool.SELF.parent.mkdir(parents=True)
+        tool.SELF.write_text('my script\n')
+        with self.assertRaisesRegex(RuntimeError, 'unmanaged'):
+            tool.main(['install-self'])
+        self.assertEqual(tool.SELF.read_text(), 'my script\n')
+
+    def test_codex_status_metadata_only_and_custom_state_root(self):
+        codex_home = self.base / 'persistent-codex'
+        codex_home.mkdir()
+        (codex_home / 'auth.json').write_text('PRIVATE_FIXTURE_DO_NOT_PRINT')
+        (codex_home / 'config.toml').write_text('PRIVATE_CONFIG_FIXTURE')
+        before = sorted(self.base.rglob('*'))
+        with mock.patch.dict(os.environ, {'CODEX_HOME': str(codex_home)}), \
+             mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(tool, 'run', side_effect=AssertionError('must not execute Codex')), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            tool.main(['codex', 'status'])
+        self.assertIn(str(codex_home), output.getvalue())
+        self.assertIn('auth.json: present', output.getvalue())
+        self.assertNotIn('PRIVATE_', output.getvalue())
+        self.assertEqual(before, sorted(self.base.rglob('*')))
+
+    def test_codex_split_installation_deferred_without_side_effects(self):
+        before = sorted(self.base.rglob('*'))
+        for action in ['install', 'prepare']:
+            with self.subTest(action=action), \
+                 mock.patch.object(tool, 'goinfre', side_effect=AssertionError('no storage mutation')), \
+                 mock.patch.object(tool, 'run', side_effect=AssertionError('no installer')):
+                with self.assertRaisesRegex(RuntimeError, 'deferred'):
+                    tool.main(['codex', action])
+        self.assertEqual(before, sorted(self.base.rglob('*')))
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -33,6 +33,7 @@ OLD_BRAVE = HOME / '.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browse
 OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
 STATE = HOME / '.local/share/thin-client'
 SELF = HOME / '.local/bin/thin-client-setup'
+VERSION = '0.2.0'
 CACHE_NAMES = {'Cache', 'Code Cache', 'GPUCache', 'GPUPersistentCache',
                'GrShaderCache', 'ShaderCache', 'GraphiteDawnCache',
                'DawnGraphiteCache', 'DawnWebGPUCache', 'CacheStorage',
@@ -350,7 +351,9 @@ def brave_cache_link(path, target, root):
     if path.exists() and not path.is_symlink():
         if (not profile_cache or path.name not in BRAVE_RELOCATABLE_CACHES or
                 not path.is_dir() or path.is_mount()):
-            raise RuntimeError(f'Existing data blocks cache redirection (left intact): {path}')
+            raise RuntimeError(f'Existing data blocks cache redirection (left intact): {path}; '
+                               'only six known cache names at the root, Default, or Profile N '
+                               'may be relocated, and they must be real directories, not mounts')
         if root.name != 'thin-client':
             raise RuntimeError(f'Unexpected thin-client root: {root}')
         validate_goinfre(root.parent, HOME)
@@ -358,9 +361,24 @@ def brave_cache_link(path, target, root):
         safe(target).mkdir(parents=True, exist_ok=True)
         stopped(('brave',))
         safe(path)
+        if not path.is_dir() or path.is_symlink() or path.is_mount():
+            raise RuntimeError(f'Brave cache changed during stopped check (left intact): {path}')
+        # Refuse profile/cache mount escapes, including mounted trees within a cache.
+        for parent in [BRAVE, *path.parents]:
+            if parent == BRAVE or BRAVE in parent.parents:
+                if parent.is_mount():
+                    raise RuntimeError(f'Mount in Brave cache path (left intact): {parent}')
+        def walk_error(error):
+            raise RuntimeError(f'Cannot inspect Brave cache safely (left intact): {error.filename}') from error
+        for directory, dirs, _ in os.walk(path, followlinks=False, onerror=walk_error):
+            for name in dirs:
+                child = Path(directory) / name
+                if not child.is_symlink() and child.is_mount():
+                    raise RuntimeError(f'Mount inside Brave cache (left intact): {child}')
         backups = safe(root / 'cache-backups')
         backups.mkdir(parents=True, exist_ok=True)
         backup = Path(tempfile.mkdtemp(prefix='brave-', dir=backups)) / path.name
+        print(f'Relocating stopped Brave cache: {path} -> {backup}', flush=True)
         # HOME and goinfre are separate filesystems: copy before removing the
         # source. shutil.move preserves nested symlinks and retains the source
         # if copying fails; backups are never automatically pruned.
@@ -371,8 +389,8 @@ def brave_cache_link(path, target, root):
 def brave_caches(root):
     safe(BRAVE)
     if BRAVE.is_dir():
-        for parent in [BRAVE, *[p for p in BRAVE.iterdir() if p.is_dir() and
-                       (p.name == 'Default' or re.fullmatch(r'Profile [0-9]+', p.name))]]:
+        for parent in [BRAVE, *[p for p in BRAVE.iterdir() if
+                       (p.name == 'Default' or re.fullmatch(r'Profile [0-9]+', p.name)) and p.is_dir()]]:
             for name in sorted(CACHE_NAMES - {'BrowserMetrics-spare.pma', 'ScriptCache', 'CacheStorage'}):
                 brave_cache_link(parent / name, root / 'cache/brave-profile' / parent.relative_to(BRAVE) / name, root)
             if parent != BRAVE:
@@ -465,10 +483,14 @@ def migrate_code():
 def environment(root, app):
     env = dict(os.environ)
     env['XDG_CONFIG_HOME'] = str(HOME / '.config')
+    env['XDG_DATA_HOME'] = str(HOME / '.local/share')
     env['XDG_CACHE_HOME'] = str(root / 'cache' / app)
     env['TMPDIR'] = str(root / 'tmp')
     paths = [root / 'cache' / app, root / 'tmp']
     if app == 'vscode':
+        # xdg-open's generic fallback can honor BROWSER. Use desktop handlers
+        # for native Code, without forcing a browser or changing the shell.
+        env.pop('BROWSER', None)
         paths.append(root / 'vscode-extensions')
     for p in paths:
         safe(p).mkdir(parents=True, exist_ok=True)
@@ -495,6 +517,7 @@ def desktop_integration():
     """Write launchers without installing extensions or requiring apps to quit."""
     apps = HOME / '.local/share/applications'
     safe(apps).mkdir(parents=True, exist_ok=True)
+    safe(HOME / '.local/bin').mkdir(parents=True, exist_ok=True)
     for app, title, command, icon, category in [
         ('brave', 'Brave (native thin client)', 'brave-native', 'com.brave.Browser', 'Network;WebBrowser;'),
         ('code', 'VS Code (native thin client)', 'code-native', 'com.visualstudio.code', 'Development;IDE;')]:
@@ -516,8 +539,9 @@ def desktop_integration():
                  'Icon=com.visualstudio.code\nNoDisplay=true\nStartupNotify=true\n'
                  'Categories=Development;IDE;\nMimeType=x-scheme-handler/vscode;\n', 0o644)
     if shutil.which('update-desktop-database'):
-        run(['update-desktop-database', apps])
-    run(['xdg-mime', 'default', 'code-native-url-handler.desktop', 'x-scheme-handler/vscode'])
+        run(['update-desktop-database', apps], env=xdg_environment())
+    run(['xdg-mime', 'default', 'code-native-url-handler.desktop', 'x-scheme-handler/vscode'],
+        env=xdg_environment())
     print('Launchers installed; vscode URI handler registered; browser default and shell configuration unchanged', flush=True)
 
 def managed_file(path, contents, mode):
@@ -531,6 +555,8 @@ def managed_file(path, contents, mode):
         os.chmod(temporary, mode)
         os.replace(temporary, path)
         print(f'Wrote managed file: {path}', flush=True)
+    elif stat.S_IMODE(path.stat().st_mode) != mode:
+        path.chmod(mode)
 
 def open_app(root, app, args):
     if any(a.startswith(('--user-data-dir', '--extensions-dir', '--disk-cache-dir', '--disk-cache-size')) for a in args):
@@ -571,13 +597,10 @@ def audit():
         print(f'Goinfre unavailable: {error}', flush=True)
     if shutil.which('flatpak'):
         run(['flatpak', 'ps', '--columns=application'])
-    for scheme in ['http', 'https', 'vscode']:
-        if shutil.which('xdg-mime'):
-            r = run(['xdg-mime', 'query', 'default', f'x-scheme-handler/{scheme}'],
-                    capture_output=True, text=True)
-            print(f'{scheme} handler: {r.stdout.strip() or "unset"}', flush=True)
+    desktop_diagnostics()
 
 def doctor():
+    script_status()
     audit()
     tools = ['python3', 'curl', 'rsync', 'ps', 'du', 'df', 'xdg-mime', 'xdg-settings']
     for tool in tools:
@@ -588,20 +611,100 @@ def doctor():
 
 def install_self():
     source = Path(__file__).resolve()
+    safe(SELF)
     if source == SELF.resolve():
         return
     safe(SELF.parent).mkdir(parents=True, exist_ok=True)
     managed_file(SELF, source.read_text(), 0o755)
+    if digest(source) != digest(SELF):
+        raise RuntimeError('Installed script differs after update; inspect before proceeding')
+    print(f'Installed setup {VERSION}: {SELF}; SHA-256 {digest(SELF)}', flush=True)
+
+def script_status():
+    """Compare script bytes, without mistaking a git pull for an installed update."""
+    source = Path(__file__).resolve()
+    print(f'Executing setup {VERSION}: {source}; SHA-256 {digest(source)}', flush=True)
+    if (source.parent / '.git').exists():
+        result = run(['git', '-C', source.parent, 'rev-parse', 'HEAD'],
+                     capture_output=True, text=True)
+        print(f'Checkout HEAD: {result.stdout.strip()} (script hash includes local edits)', flush=True)
+    if SELF.is_file():
+        installed_hash = digest(SELF)
+        print(f'Installed setup: {SELF}; SHA-256 {installed_hash}', flush=True)
+        if installed_hash != digest(source):
+            print('UPDATE REQUIRED: run ./thin-client-setup install-self from the reviewed checkout', flush=True)
+        else:
+            print('Installed script matches executing script.', flush=True)
+    else:
+        print('Installed script missing: run ./thin-client-setup install-self from the reviewed checkout', flush=True)
+    if source == SELF.resolve():
+        print('Repository version unknown from installed copy; run ./thin-client-setup status '
+              'in the checkout after git pull to compare.', flush=True)
+
+def xdg_environment():
+    env = dict(os.environ)
+    env['XDG_CONFIG_HOME'] = str(HOME / '.config')
+    env['XDG_DATA_HOME'] = str(HOME / '.local/share')
+    return env
+
+def desktop_diagnostics():
+    """Report actual defaults against the explicit native deployment choice."""
+    checks = [('default web browser', ['xdg-settings', 'get', 'default-web-browser'],
+               'brave-native.desktop')]
+    checks += [(f'{scheme} handler', ['xdg-mime', 'query', 'default', f'x-scheme-handler/{scheme}'],
+                'code-native-url-handler.desktop' if scheme == 'vscode' else 'brave-native.desktop')
+               for scheme in ['http', 'https', 'vscode']]
+    ok = True
+    for label, command, expected in checks:
+        try:
+            value = run(command, capture_output=True, text=True,
+                        env=xdg_environment()).stdout.strip() or 'unset'
+            match = value == expected
+        except (OSError, subprocess.CalledProcessError):
+            value, match = 'unavailable (query failed)', False
+        print(f'{label}: {value}; expected {expected}; {"OK" if match else "MISMATCH"}', flush=True)
+        ok = ok and match
+    apps = HOME / '.local/share/applications'
+    for name in ['brave-native.desktop', 'code-native.desktop', 'code-native-url-handler.desktop']:
+        present = (apps / name).is_file()
+        print(f'Expected desktop entry: {apps / name}; {"present" if present else "MISSING"}', flush=True)
+        ok = ok and present
+    if 'BROWSER' in os.environ:
+        print('BROWSER is set in the shell; native Code omits it and uses desktop handlers.', flush=True)
+    if not ok:
+        print('For the native deployment, run thin-client-setup defaults brave explicitly. '
+              'Diagnostics do not change defaults.', flush=True)
+    return ok
 
 def make_default_browser():
     apps = HOME / '.local/share/applications'
     for name in ['brave-native.desktop', 'code-native-url-handler.desktop']:
         if not (apps / name).is_file():
             raise RuntimeError('Run integrate/desktop before registering defaults')
-    run(['xdg-settings', 'set', 'default-web-browser', 'brave-native.desktop'])
+    run(['xdg-settings', 'set', 'default-web-browser', 'brave-native.desktop'], env=xdg_environment())
     for scheme in ['http', 'https']:
-        run(['xdg-mime', 'default', 'brave-native.desktop', f'x-scheme-handler/{scheme}'])
+        run(['xdg-mime', 'default', 'brave-native.desktop', f'x-scheme-handler/{scheme}'],
+            env=xdg_environment())
+    run(['xdg-mime', 'default', 'code-native-url-handler.desktop', 'x-scheme-handler/vscode'],
+        env=xdg_environment())
+    if not desktop_diagnostics():
+        raise RuntimeError('Desktop defaults did not match after registration; see diagnostics above')
     print('Explicit choice applied: native Brave is the HTTP/HTTPS default', flush=True)
+
+def codex_status(root):
+    """Metadata only. Do not execute Codex, read credentials, or migrate state."""
+    codex_home = Path(os.environ.get('CODEX_HOME', str(HOME / '.codex')))
+    print(f'Codex command: {shutil.which("codex") or "not on PATH"}', flush=True)
+    print(f'Codex state root: {codex_home}', flush=True)
+    for name, kind in [('config.toml', 'configuration'), ('auth.json', 'file credentials (optional)'),
+                       ('sessions', 'session state'), ('history.jsonl', 'history'),
+                       ('packages', 'managed executable packages'), ('plugins', 'plugin resources/state'),
+                       ('skills', 'skills')]:
+        print(f'{name}: {"present" if (codex_home / name).exists() else "absent"}; {kind}', flush=True)
+    print('Codex split installation is not implemented: CODEX_HOME selects the entire state root; '
+          'CODEX_INSTALL_DIR changes only the visible command location, not the standalone package cache. '
+          f'A wholly disposable state root could be {root / "codex-home"}, but auth, sessions, '
+          'config and skills there would also be lost on a new post. See README.', flush=True)
 
 def flatpak_path(app):
     if app not in APP_IDS:
@@ -690,12 +793,19 @@ def retire_flatpak(root, app, *, dry_run=False, verified=False, yes=False, backu
 
 def cli_parser():
     parser = argparse.ArgumentParser(description='Native Brave + VS Code thin client; no HOME binary fallback')
+    parser.add_argument('--version', action='version', version=f'thin-client-setup {VERSION}')
     subs = parser.add_subparsers(dest='command', required=True)
-    for command in ['audit', 'doctor', 'status', 'install', 'migrate', 'integrate', 'desktop', 'prepare', 'browser-default']:
+    for command in ['audit', 'doctor', 'status', 'install-self', 'install', 'migrate', 'integrate', 'desktop', 'prepare', 'browser-default']:
         sub = subs.add_parser(command)
         sub.add_argument('--dry-run', action='store_true')
         if command in ['integrate', 'prepare']:
             sub.add_argument('--make-default-browser', action='store_true', help='Explicit consent to native HTTP/HTTPS defaults')
+    sub = subs.add_parser('defaults', help='Explicitly register the native browser and Code callback')
+    sub.add_argument('browser', choices=['brave'])
+    sub.add_argument('--dry-run', action='store_true')
+    sub = subs.add_parser('codex', help='Inspect Codex storage; safe persistent/package split is deferred')
+    sub.add_argument('action', choices=['status', 'install', 'prepare'])
+    sub.add_argument('--dry-run', action='store_true')
     sub = subs.add_parser('open')
     sub.add_argument('app', choices=['brave', 'code'])
     sub.add_argument('args', nargs=argparse.REMAINDER)
@@ -713,11 +823,34 @@ def main(argv=None):
     if command in ['audit', 'doctor']:
         (audit if command == 'audit' else doctor)()
         return
+    if command == 'install-self':
+        if options.dry_run:
+            print('DRY RUN: install-self; installed script unchanged')
+            return
+        safe(STATE).mkdir(parents=True, exist_ok=True)
+        with (STATE / 'setup.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            install_self()
+        return
+    if command == 'status':
+        script_status()
+        desktop_diagnostics()
+    if command == 'codex' and options.action != 'status':
+        raise RuntimeError('Codex install/prepare is deferred: no supported independent heavy-package '
+                           'root was established for persistent CODEX_HOME. No files changed. '
+                           'See README for supported alternatives; codex status is read-only.')
     root = goinfre()
     print(f'Goinfre: {root}\nBrave persistent profile: {BRAVE}\nVS Code persistent state: {CODE}', flush=True)
     if command == 'status':
         for p in [root / 'apps/brave/current', root / 'apps/vscode/current', BRAVE, CODE, root / 'vscode-extensions']:
             print(p, 'present' if p.exists() else 'missing')
+        if not all(os.access(root / exe, os.X_OK) for exe in
+                   ['apps/brave/current/brave', 'apps/vscode/current/bin/code']):
+            print('New/unprepared workstation detected. Run: ~/.local/bin/thin-client-setup prepare '
+                  '(after quitting applications). No downloads were started.', flush=True)
+        return
+    if command == 'codex':
+        codex_status(root)
         return
     if getattr(options, 'dry_run', False):
         if command == 'retire-flatpak':
@@ -733,7 +866,7 @@ def main(argv=None):
     with (STATE / 'setup.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         safe(root).mkdir(parents=True, exist_ok=True)
-        if command in ['install', 'integrate', 'desktop', 'prepare']:
+        if command in ['install', 'integrate', 'desktop', 'prepare', 'defaults']:
             install_self()
         if command in ['install', 'prepare']:
             install(root)
@@ -741,9 +874,9 @@ def main(argv=None):
             migrate(root)
         if command in ['integrate', 'prepare']:
             integrate(root)
-        if command == 'desktop':
+        if command in ['desktop', 'defaults']:
             desktop_integration()
-        if command == 'browser-default' or getattr(options, 'make_default_browser', False):
+        if command in ['browser-default', 'defaults'] or getattr(options, 'make_default_browser', False):
             make_default_browser()
         if command == 'retire-flatpak':
             retire_flatpak(root, options.app, verified=options.verified, yes=options.yes,

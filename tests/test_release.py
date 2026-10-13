@@ -191,6 +191,145 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual((path / 'important').read_text(), 'keep')
         self.assertFalse((self.root / 'cache-backups').exists())
 
+    def browser_site_state_fixture(self, profile_root):
+        persistent = {
+            'Default/Service Worker/Database/persistent-db': b'registrations\x00\xff',
+            'Default/Service Worker/ScriptCache/service-worker-script': b'installed worker script',
+            'Default/Service Worker/CacheStorage/site-cache-data': b'offline site data',
+            'Default/Some Application Data/Cache/important': b'application state',
+            'Default/Foo/ScriptCache/important': b'user script',
+            'Default/Whatever/GPUCache/important': b'user data with cache-like basename',
+            'Default/IndexedDB/site/Cache/important': b'indexed database',
+            'Default/Local Storage/important': b'local storage',
+            'Default/Session Storage/important': b'session storage',
+            'Default/WebStorage/important': b'web storage',
+            'Profile 12/Service Worker/ScriptCache/important': b'numbered profile script',
+        }
+        for relative, contents in persistent.items():
+            path = profile_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+        for name in ['DawnWebGPUCache', 'GPUCache']:
+            path = profile_root / 'Default' / name
+            path.mkdir(parents=True)
+            (path / 'gpu-file').write_bytes(name.encode())
+        return persistent
+
+    def test_prepare_and_open_ignore_persistent_site_storage_idempotently(self):
+        self.native_fixture('brave')
+        self.native_fixture('code')
+        persistent = self.browser_site_state_fixture(tool.BRAVE)
+        persistent_dirs = {tool.BRAVE / relative for relative in
+                           ['Default/Service Worker', 'Default/Some Application Data',
+                            'Default/Foo', 'Default/Whatever', 'Default/IndexedDB',
+                            'Default/Local Storage', 'Default/Session Storage', 'Default/WebStorage',
+                            'Profile 12/Service Worker']}
+        before = {relative: (tool.BRAVE / relative).lstat() for relative in persistent}
+        original_stat = Path.stat
+        def guard(path, *args, **kwargs):
+            if any(path == directory or directory in path.parents for directory in persistent_dirs):
+                self.fail(f'Cache setup inspected persistent site state: {path}')
+            return original_stat(path, *args, **kwargs)
+        with self.fake_mount(), mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'install'), \
+             mock.patch.object(tool, 'stopped'), mock.patch.object(tool, 'run'), \
+             mock.patch.object(tool, 'desktop_integration'), mock.patch.object(tool.os, 'execve') as execute:
+            original_stat = Path.stat  # retain the fixture's separate-filesystem simulation
+            with mock.patch.object(Path, 'stat', guard):
+                tool.main(['prepare'])
+                tool.main(['prepare'])
+                tool.open_app(self.root, 'brave', [])
+                execute.assert_called_once()
+        for relative, contents in persistent.items():
+            path = tool.BRAVE / relative
+            self.assertEqual(path.read_bytes(), contents)
+            self.assertFalse(path.parent.is_symlink())
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(path.lstat().st_ino, before[relative].st_ino)
+            self.assertEqual(path.lstat().st_mtime_ns, before[relative].st_mtime_ns)
+        backups = list((self.root / 'cache-backups').glob('*/*'))
+        self.assertEqual({path.name for path in backups}, {'DawnWebGPUCache', 'GPUCache'})
+        self.assertEqual(len(backups), 2)
+        for name in ['DawnWebGPUCache', 'GPUCache']:
+            path = tool.BRAVE / 'Default' / name
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(path.resolve(), self.root / 'cache/brave-profile/Default' / name)
+            backup = next(path for path in backups if path.name == name)
+            self.assertEqual((backup / 'gpu-file').read_bytes(), name.encode())
+        self.assertFalse((tool.STATE / 'cache-backups').exists())
+
+    def test_unapproved_nested_paths_refused_before_cache_validation(self):
+        for relative in ['Default/Service Worker/ScriptCache', 'Default/Service Worker/CacheStorage',
+                         'Default/Foo/ScriptCache', 'Default/Whatever/GPUCache',
+                         'Default/Some Application Data/Cache']:
+            with self.subTest(relative=relative), \
+                 mock.patch.object(tool, 'safe', side_effect=AssertionError('must not validate as cache')):
+                with self.assertRaisesRegex(RuntimeError, 'Unapproved Brave cache path'):
+                    tool.brave_cache_link(tool.BRAVE / relative, self.root / 'cache/test', self.root)
+        self.assertFalse((self.root / 'cache').exists())
+
+    def test_root_rendering_caches_use_only_their_exact_root_locations(self):
+        self.native_fixture('brave')
+        for name in ['GraphiteDawnCache', 'GPUPersistentCache']:
+            path = tool.BRAVE / name
+            path.mkdir()
+            (path / 'gpu-file').write_bytes(name.encode())
+            nested = tool.BRAVE / 'Default/Whatever' / name
+            nested.mkdir(parents=True)
+            (nested / 'important').write_bytes(b'keep nested state')
+        with self.fake_mount(), mock.patch.object(tool, 'stopped'), mock.patch.object(tool.os, 'execve'):
+            tool.open_app(self.root, 'brave', [])
+        for name in ['GraphiteDawnCache', 'GPUPersistentCache']:
+            self.assertTrue((tool.BRAVE / name).is_symlink())
+            self.assertEqual((tool.BRAVE / 'Default/Whatever' / name / 'important').read_bytes(),
+                             b'keep nested state')
+            backup = next((self.root / 'cache-backups').glob(f'*/{name}/gpu-file'))
+            self.assertEqual(backup.read_bytes(), name.encode())
+
+    def test_existing_service_worker_symlink_is_not_validated_or_rewritten(self):
+        self.native_fixture('brave')
+        profile = tool.BRAVE / 'Default'
+        profile.mkdir()
+        state = profile / 'Service Worker'
+        state.symlink_to(self.base / 'missing-site-state')
+        with mock.patch.object(tool.os, 'execve') as execute:
+            tool.open_app(self.root, 'brave', [])
+            execute.assert_called_once()
+        self.assertEqual(os.readlink(state), str(self.base / 'missing-site-state'))
+        self.assertFalse((self.base / 'missing-site-state').exists())
+        self.assertFalse((self.root / 'cache-backups').exists())
+
+    @unittest.skipUnless(shutil.which('rsync'), 'rsync is required for profile copy integration')
+    def test_real_brave_migration_preserves_site_state_and_nested_cache_names(self):
+        tool.OLD_BRAVE.mkdir(parents=True)
+        (tool.OLD_BRAVE / 'Local State').write_text('{}')
+        persistent = self.browser_site_state_fixture(tool.OLD_BRAVE)
+        # A file at an approved directory location is unexpected data, not a cache tree.
+        (tool.OLD_BRAVE / 'Cache').write_bytes(b'keep unexpected file')
+        with mock.patch.dict(os.environ, {'LC_ALL': 'C'}), \
+             mock.patch.object(tool.shutil, 'disk_usage', return_value=mock.Mock(free=10 * 1024**3)):
+            tool.migrate_brave(tool.BRAVE.with_name('Brave-Browser.thin-client-partial'))
+        for relative, contents in persistent.items():
+            self.assertEqual((tool.BRAVE / relative).read_bytes(), contents)
+            self.assertEqual((tool.OLD_BRAVE / relative).read_bytes(), contents)
+        self.assertEqual((tool.BRAVE / 'Cache').read_bytes(), b'keep unexpected file')
+        for name in ['DawnWebGPUCache', 'GPUCache']:
+            self.assertFalse((tool.BRAVE / 'Default' / name).exists())
+            self.assertTrue((tool.OLD_BRAVE / 'Default' / name / 'gpu-file').is_file())
+
+    @unittest.skipUnless(shutil.which('rsync'), 'rsync is required for profile backup integration')
+    def test_real_brave_retirement_backup_preserves_site_state(self):
+        tool.OLD_BRAVE.mkdir(parents=True)
+        (tool.OLD_BRAVE / 'Local State').write_text('{}')
+        persistent = self.browser_site_state_fixture(tool.OLD_BRAVE)
+        with mock.patch.dict(os.environ, {'LC_ALL': 'C'}):
+            backup = tool.backup_flatpak('brave', tool.flatpak_path('brave'), self.root)
+        for relative, contents in persistent.items():
+            self.assertEqual((backup / 'persistent-data' / relative).read_bytes(), contents)
+            self.assertEqual((tool.OLD_BRAVE / relative).read_bytes(), contents)
+        for name in ['DawnWebGPUCache', 'GPUCache']:
+            self.assertFalse((backup / 'persistent-data/Default' / name).exists())
+
     def test_running_brave_blocks_open_without_losing_contents(self):
         self.native_fixture('brave')
         path = tool.BRAVE / 'Default/DawnGraphiteCache'
@@ -204,18 +343,17 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual((path / 'generated').read_text(), 'keep')
         self.assertFalse(path.is_symlink())
 
-    def test_nonrelocatable_cache_directory_and_wrong_link_refuse_actual_brave_open(self):
+    def test_unmanaged_profile_directory_ignored_and_wrong_cache_link_refused(self):
         self.native_fixture('brave')
-        path = tool.BRAVE / 'Default/Crashpad'  # deliberately outside relocation allowlist
-        path.mkdir(parents=True)
-        (path / 'generated').write_text('keep')
+        unmanaged = tool.BRAVE / 'Default/Crashpad'
+        unmanaged.mkdir(parents=True)
+        (unmanaged / 'generated').write_text('keep')
         with mock.patch.object(tool.os, 'execve') as execute:
-            with self.assertRaisesRegex(RuntimeError, 'left intact'):
-                tool.open_app(self.root, 'brave', [])
-            execute.assert_not_called()
-        self.assertEqual((path / 'generated').read_text(), 'keep')
-        # Remove only the fixture to test an unexpected link at the same location.
-        shutil.rmtree(path)
+            tool.open_app(self.root, 'brave', [])
+            execute.assert_called_once()
+        self.assertEqual((unmanaged / 'generated').read_text(), 'keep')
+        path = tool.BRAVE / 'Default/GPUCache'
+        path.unlink()  # only the correctly generated fixture link
         path.symlink_to(self.base / 'unexpected')
         with mock.patch.object(tool.os, 'execve') as execute:
             with self.assertRaisesRegex(RuntimeError, 'Unexpected cache link'):

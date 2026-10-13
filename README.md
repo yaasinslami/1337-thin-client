@@ -134,8 +134,11 @@ Destination: `~/.config/BraveSoftware/Brave-Browser`.
 
 Preserves bookmarks, history, login/cookie databases, Local State, preferences,
 extensions and their state, IndexedDB/local storage and sessions. Omits known
-caches, shaders, crash files, locks and sockets. Service-worker cached resources
-may need downloading again. A checksum-based rsync dry run verifies the persistent
+caches only at explicitly approved relative paths, plus runtime locks and sockets.
+Service Worker registration databases, installed scripts and CacheStorage remain
+together in HOME. Anchored, directory-only rsync exclusions also preserve unknown
+nested directories with cache-like names and unexpected files at cache locations.
+A checksum-based rsync dry run verifies the persistent
 copy before its staged directory is renamed into place.
 
 Passwords/cookies may depend on the desktop keyring. Copying their files does not
@@ -247,10 +250,13 @@ application's caches and state; Brave does not require Code's extension director
 Missing cache destinations are recreated at launch; unexpected links/data cause
 a clear failure.
 
-Existing real Brave cache directories named `DawnGraphiteCache`, `DawnWebGPUCache`, `GPUCache`,
-`Code Cache`, `Cache`, `GrShaderCache`, or `ShaderCache` can be redirected after
-Brave is fully stopped. Only exact locations directly under the Brave root,
-`Default`, or `Profile <number>` qualify; symlink ancestors and mount points are
+Brave cache setup uses an explicit relative-path table, not cache-name searches.
+For `Default` and `Profile <number>`, it manages only direct `Cache`, `Code Cache`,
+`GPUCache`, `DawnGraphiteCache`, `DawnWebGPUCache`, `GrShaderCache`, and `ShaderCache`
+paths. The Brave root has a separate explicit table for those paths plus the
+root-level rendering caches `GraphiteDawnCache` and `GPUPersistentCache`.
+Existing real directories at those exact paths can be redirected after Brave is
+fully stopped. Symlink ancestors and mount points are
 refused. The directory is relocated to a unique backup under the validated
 `<goinfre>/thin-client/cache-backups/`, its location is printed, then the
 cache link is created. Cross-filesystem relocation copies the contents before
@@ -259,7 +265,17 @@ Backups remain in disposable goinfre for manual review and are never
 automatically pruned. No backup is stored in HOME. Other
 existing directories/files and unexpected links are preserved and refused.
 Persistent site databases and nested directories with cache-like names do not
-qualify. Full `migrate`, `integrate`, and `prepare` still prepare both apps.
+qualify. Cache setup does not inspect, redirect, relocate, or validate as caches:
+
+- `Service Worker/Database`, `Service Worker/ScriptCache`, and `Service Worker/CacheStorage`
+- `IndexedDB`, `Local Storage`, `Session Storage`, and `WebStorage`
+- Arbitrary nested paths such as `Some Application Data/Cache`, `Foo/ScriptCache`,
+  and `Whatever/GPUCache`
+
+These remain persistent HOME data. Their presence never blocks cache setup.
+Migration and retirement backups use the same exact-path model for cache
+exclusions and preserve this site state. Full `migrate`, `integrate`, and `prepare`
+still prepare both apps.
 
 Existing prepared users need no additional profile migration for this cache fix:
 after updating the installed setup script, Code launches independently and the
@@ -271,11 +287,15 @@ explicitly name `GPUCache`, `DawnWebGPUCache`, and `DawnGraphiteCache`; all thre
 are in both our redirection and existing-directory relocation lists.
 Its [browser rendering-cache locations](https://github.com/chromium/chromium/blob/main/chrome/browser/chrome_content_browser_client.cc)
 also name root-level `ShaderCache`, `GrShaderCache`, `GraphiteDawnCache`, and
-`GPUPersistentCache`. Those names already appear in our redirection list;
-only `ShaderCache` and `GrShaderCache` are currently accepted for relocation.
-This fix adds only the production-reproduced `DawnWebGPUCache` to that permission.
-An existing directory outside the explicit relocation list is preserved and
-refused. No `Dawn*` or `*Cache*` pattern grants relocation permission.
+`GPUPersistentCache`; those exact root paths are explicitly supported.
+An unapproved path is never offered to cache-link setup. A direct attempt to
+manage one is refused before cache validation. No `Dawn*` or `*Cache*` pattern
+grants relocation permission.
+
+This update does not rewrite old Service Worker symlinks or re-import an existing
+native profile. If an older setup already redirected or omitted site state,
+review the retained Flatpak source or backup before restoring it with Brave
+stopped. Existing browser/site data is never overwritten automatically.
 
 Prior application releases and downloads are retained for rollback. Audit their
 space periodically; this tool does not silently prune them.

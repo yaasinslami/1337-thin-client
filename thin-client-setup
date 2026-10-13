@@ -34,13 +34,16 @@ OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
 STATE = HOME / '.local/share/thin-client'
 SELF = HOME / '.local/bin/thin-client-setup'
 VERSION = '0.2.0'
-CACHE_NAMES = {'Cache', 'Code Cache', 'GPUCache', 'GPUPersistentCache',
-               'GrShaderCache', 'ShaderCache', 'GraphiteDawnCache',
-               'DawnGraphiteCache', 'DawnWebGPUCache', 'CacheStorage',
-               'ScriptCache', 'component_crx_cache', 'extensions_crx_cache',
-               'Crash Reports', 'Crashpad', 'BrowserMetrics', 'BrowserMetrics-spare.pma'}
-BRAVE_RELOCATABLE_CACHES = {'DawnGraphiteCache', 'DawnWebGPUCache', 'GPUCache', 'Code Cache',
-                            'Cache', 'GrShaderCache', 'ShaderCache'}
+BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS = (
+    Path('Cache'), Path('Code Cache'), Path('GPUCache'),
+    Path('DawnGraphiteCache'), Path('DawnWebGPUCache'),
+    Path('GrShaderCache'), Path('ShaderCache'),
+)
+# Root locations are separate from profile locations. These two additional
+# rendering caches are defined by Chromium's browser content client.
+BRAVE_ROOT_DISPOSABLE_CACHE_PATHS = BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS + (
+    Path('GraphiteDawnCache'), Path('GPUPersistentCache'),
+)
 CODE_CACHES = ['Cache', 'Code Cache', 'CachedData', 'CachedProfilesData',
                'CachedExtensionVSIXs', 'GPUCache', 'DawnGraphiteCache',
                'DawnWebGPUCache', 'logs', 'Crashpad']
@@ -341,18 +344,20 @@ def vscode_caches(root):
 
 def brave_cache_link(path, target, root):
     """Preserve allowlisted caches in goinfre before redirecting exact locations."""
-    safe(BRAVE)
-    safe(path.parent)
     relative = path.relative_to(BRAVE)
     parts = relative.parts
-    profile_cache = (len(parts) == 1 or
-                     (len(parts) == 2 and (parts[0] == "Default" or
-                                           re.fullmatch(r"Profile [0-9]+", parts[0]))))
+    approved = (relative in BRAVE_ROOT_DISPOSABLE_CACHE_PATHS or
+                (len(parts) == 2 and
+                 (parts[0] == 'Default' or re.fullmatch(r'Profile [0-9]+', parts[0])) and
+                 Path(parts[1]) in BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS))
+    if not approved:
+        raise RuntimeError(f'Unapproved Brave cache path (left intact): {path}')
+    safe(BRAVE)
+    safe(path.parent)
     if path.exists() and not path.is_symlink():
-        if (not profile_cache or path.name not in BRAVE_RELOCATABLE_CACHES or
-                not path.is_dir() or path.is_mount()):
+        if not path.is_dir() or path.is_mount():
             raise RuntimeError(f'Existing data blocks cache redirection (left intact): {path}; '
-                               'only explicitly allowlisted cache names at the root, Default, or Profile N '
+                               'only explicitly approved relative cache paths '
                                'may be relocated, and they must be real directories, not mounts')
         if root.name != 'thin-client':
             raise RuntimeError(f'Unexpected thin-client root: {root}')
@@ -386,17 +391,26 @@ def brave_cache_link(path, target, root):
         print(f'Preserved Brave cache: {path} -> {backup}', flush=True)
     cache_link(path, target)
 
+def brave_disposable_relative_paths(profile_root):
+    """Construct exact paths; inspect only immediate children to find profiles."""
+    yield from BRAVE_ROOT_DISPOSABLE_CACHE_PATHS
+    if profile_root.is_dir():
+        for profile in sorted(profile_root.iterdir()):
+            if (profile.name == 'Default' or re.fullmatch(r'Profile [0-9]+', profile.name)) and profile.is_dir():
+                for relative in BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS:
+                    yield Path(profile.name) / relative
+
+def brave_copy_excludes(profile_root):
+    # Leading / anchors each exclusion to the source profile root. Trailing /
+    # excludes directories only, preserving unexpected files at those locations.
+    return [f'--exclude=/{relative.as_posix()}/'
+            for relative in brave_disposable_relative_paths(profile_root)]
+
 def brave_caches(root):
     safe(BRAVE)
     if BRAVE.is_dir():
-        for parent in [BRAVE, *[p for p in BRAVE.iterdir() if
-                       (p.name == 'Default' or re.fullmatch(r'Profile [0-9]+', p.name)) and p.is_dir()]]:
-            for name in sorted(CACHE_NAMES - {'BrowserMetrics-spare.pma', 'ScriptCache', 'CacheStorage'}):
-                brave_cache_link(parent / name, root / 'cache/brave-profile' / parent.relative_to(BRAVE) / name, root)
-            if parent != BRAVE:
-                for name in ['ScriptCache', 'CacheStorage']:
-                    brave_cache_link(parent / 'Service Worker' / name,
-                               root / 'cache/brave-profile' / parent.name / 'Service Worker' / name, root)
+        for relative in brave_disposable_relative_paths(BRAVE):
+            brave_cache_link(BRAVE / relative, root / 'cache/brave-profile' / relative, root)
 
 def migrate(root):
     stopped()
@@ -422,7 +436,7 @@ def migrate_brave(stage):
     safe(OLD_BRAVE)
     if not (OLD_BRAVE / 'Local State').is_file():
         raise RuntimeError('Flatpak Brave source exists but lacks Local State')
-    excludes = [f'--exclude={n}' for n in sorted(CACHE_NAMES)]
+    excludes = brave_copy_excludes(OLD_BRAVE)
     excludes += ['--exclude=Singleton*', '--exclude=*.lock', '--exclude=*.sock',
                  '--exclude=.org.chromium.*', '--exclude=.thin-client-import']
     dry = run(['rsync', '-an', '--stats', *excludes, str(OLD_BRAVE) + '/', str(stage) + '/'],
@@ -728,9 +742,9 @@ def backup_flatpak(app, source, root):
         if not source.is_dir():
             raise RuntimeError('Cannot back up missing VS Code User directory')
     safe(source)
-    excludes = [f'--exclude={n}' for n in sorted(CACHE_NAMES | {'logs', 'Shared Dictionary'})]
+    excludes = brave_copy_excludes(source) if app == 'brave' else []
     excludes += ['--exclude=Singleton*', '--exclude=*.lock', '--exclude=*.sock',
-                 '--exclude=.org.chromium.*', '--exclude=CrashpadMetrics*', '--exclude=/Safe Browsing']
+                 '--exclude=.org.chromium.*']
     payload = destination / 'persistent-data'
     run(['rsync', '-a', *excludes, str(source) + '/', str(payload) + '/'])
     verify = run(['rsync', '-anc', '--itemize-changes', *excludes,

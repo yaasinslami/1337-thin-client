@@ -249,24 +249,25 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse((self.root / 'vscode-extensions').exists())
 
     def test_known_brave_caches_preserved_then_linked(self):
-        for name in sorted(tool.BRAVE_RELOCATABLE_CACHES):
+        cache_names = {p.as_posix() for p in tool.BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS}
+        for name in sorted(cache_names):
             cache = tool.BRAVE / 'Default' / name
             cache.mkdir(parents=True)
             (cache / 'generated').write_text(name)
         with self.fake_mount(), mock.patch.object(tool, 'stopped') as stopped:
             tool.brave_caches(self.root)
-            self.assertEqual(stopped.call_count, len(tool.BRAVE_RELOCATABLE_CACHES))
+            self.assertEqual(stopped.call_count, len(cache_names))
             stopped.assert_called_with(('brave',))
             tool.brave_caches(self.root)
-            self.assertEqual(stopped.call_count, len(tool.BRAVE_RELOCATABLE_CACHES))
+            self.assertEqual(stopped.call_count, len(cache_names))
         # Every original cache payload is retained outside the browser profile.
         preserved = {p.read_text() for p in (self.root / 'cache-backups').glob('*/*/generated')}
-        self.assertEqual(preserved, tool.BRAVE_RELOCATABLE_CACHES)
+        self.assertEqual(preserved, cache_names)
         for backup in (self.root / 'cache-backups').glob('*/*'):
             self.assertTrue(backup.is_relative_to(self.root))
             self.assertFalse(backup.is_relative_to(self.home))
         self.assertFalse((tool.STATE / 'cache-backups').exists())
-        for name in tool.BRAVE_RELOCATABLE_CACHES:
+        for name in cache_names:
             self.assertTrue((tool.BRAVE / 'Default' / name).is_symlink())
 
     def test_brave_backup_rejects_arbitrary_home_root(self):

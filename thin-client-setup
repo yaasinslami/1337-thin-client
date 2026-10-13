@@ -39,7 +39,7 @@ CACHE_NAMES = {'Cache', 'Code Cache', 'GPUCache', 'GPUPersistentCache',
                'DawnGraphiteCache', 'DawnWebGPUCache', 'CacheStorage',
                'ScriptCache', 'component_crx_cache', 'extensions_crx_cache',
                'Crash Reports', 'Crashpad', 'BrowserMetrics', 'BrowserMetrics-spare.pma'}
-BRAVE_RELOCATABLE_CACHES = {'DawnGraphiteCache', 'GPUCache', 'Code Cache',
+BRAVE_RELOCATABLE_CACHES = {'DawnGraphiteCache', 'DawnWebGPUCache', 'GPUCache', 'Code Cache',
                             'Cache', 'GrShaderCache', 'ShaderCache'}
 CODE_CACHES = ['Cache', 'Code Cache', 'CachedData', 'CachedProfilesData',
                'CachedExtensionVSIXs', 'GPUCache', 'DawnGraphiteCache',
@@ -352,7 +352,7 @@ def brave_cache_link(path, target, root):
         if (not profile_cache or path.name not in BRAVE_RELOCATABLE_CACHES or
                 not path.is_dir() or path.is_mount()):
             raise RuntimeError(f'Existing data blocks cache redirection (left intact): {path}; '
-                               'only six known cache names at the root, Default, or Profile N '
+                               'only explicitly allowlisted cache names at the root, Default, or Profile N '
                                'may be relocated, and they must be real directories, not mounts')
         if root.name != 'thin-client':
             raise RuntimeError(f'Unexpected thin-client root: {root}')

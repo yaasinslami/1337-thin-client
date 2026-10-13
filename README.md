@@ -247,7 +247,7 @@ application's caches and state; Brave does not require Code's extension director
 Missing cache destinations are recreated at launch; unexpected links/data cause
 a clear failure.
 
-Existing real Brave cache directories named `DawnGraphiteCache`, `GPUCache`,
+Existing real Brave cache directories named `DawnGraphiteCache`, `DawnWebGPUCache`, `GPUCache`,
 `Code Cache`, `Cache`, `GrShaderCache`, or `ShaderCache` can be redirected after
 Brave is fully stopped. Only exact locations directly under the Brave root,
 `Default`, or `Profile <number>` qualify; symlink ancestors and mount points are
@@ -265,6 +265,17 @@ Existing prepared users need no additional profile migration for this cache fix:
 after updating the installed setup script, Code launches independently and the
 next Brave launch redirects allowlisted existing caches if Brave is stopped.
 Profile or nested-cache mount points are refused as well as symlink ancestors.
+
+Chromium's current [GPU cache subdirectory definitions](https://github.com/chromium/chromium/blob/main/gpu/ipc/common/gpu_disk_cache_type.cc)
+explicitly name `GPUCache`, `DawnWebGPUCache`, and `DawnGraphiteCache`; all three
+are in both our redirection and existing-directory relocation lists.
+Its [browser rendering-cache locations](https://github.com/chromium/chromium/blob/main/chrome/browser/chrome_content_browser_client.cc)
+also name root-level `ShaderCache`, `GrShaderCache`, `GraphiteDawnCache`, and
+`GPUPersistentCache`. Those names already appear in our redirection list;
+only `ShaderCache` and `GrShaderCache` are currently accepted for relocation.
+This fix adds only the production-reproduced `DawnWebGPUCache` to that permission.
+An existing directory outside the explicit relocation list is preserved and
+refused. No `Dawn*` or `*Cache*` pattern grants relocation permission.
 
 Prior application releases and downloads are retained for rollback. Audit their
 space periodically; this tool does not silently prune them.
@@ -320,6 +331,14 @@ contain personal paths; never commit them to this repository.
 
 **`git pull` updates the checkout, not `~/.local/bin/thin-client-setup`.** Both
 native wrappers execute that installed script. Upgrade from a reviewed checkout:
+
+**For the first upgrade from an older installation, the `./` is required:** run
+`./thin-client-setup install-self` from the checkout. Running
+`thin-client-setup install-self` without `./` may invoke the old installed copy,
+which can reject `install-self` as an invalid command even after `git pull`.
+Once the repository command has replaced the installed copy, subsequent
+`thin-client-setup ...` commands use the updated implementation (provided
+`~/.local/bin` is on PATH). The full installed path below avoids PATH ambiguity.
 
 ```sh
 cd ~/goinfre/projects/1337-thin-client

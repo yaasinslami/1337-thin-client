@@ -136,14 +136,60 @@ class ReleaseTests(unittest.TestCase):
     def test_profile_number_cache_relocation_and_launch_idempotent(self):
         self.native_fixture('brave')
         for profile in ['Profile 1', 'Profile 12']:
-            path = tool.BRAVE / profile / 'DawnGraphiteCache'
-            path.mkdir(parents=True)
-            (path / 'generated').write_text(profile)
+            for name in ['DawnGraphiteCache', 'DawnWebGPUCache']:
+                path = tool.BRAVE / profile / name
+                path.mkdir(parents=True)
+                (path / 'generated').write_text(f'{profile}/{name}')
         with self.fake_mount(), mock.patch.object(tool, 'stopped'), mock.patch.object(tool.os, 'execve'):
             tool.open_app(self.root, 'brave', [])
             tool.open_app(self.root, 'brave', [])
         self.assertEqual({p.read_text() for p in (self.root / 'cache-backups').glob('*/*/generated')},
-                         {'Profile 1', 'Profile 12'})
+                         {f'{profile}/{name}' for profile in ['Profile 1', 'Profile 12']
+                          for name in ['DawnGraphiteCache', 'DawnWebGPUCache']})
+
+    def test_prepare_relocates_real_dawn_webgpu_cache_idempotently(self):
+        self.native_fixture('brave')
+        self.native_fixture('code')
+        path = tool.BRAVE / 'Default/DawnWebGPUCache'
+        path.mkdir(parents=True)
+        (path / 'some-test-file').write_bytes(b'production reproduction fixture')
+        with self.fake_mount(), mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(tool, 'stopped') as stopped, mock.patch.object(tool, 'install_self'), \
+             mock.patch.object(tool, 'install'), mock.patch.object(tool, 'run'), \
+             mock.patch.object(tool, 'desktop_integration'), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            tool.main(['prepare'])
+            self.assertIn(mock.call(('brave',)), stopped.call_args_list)
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(path.resolve(), self.root / 'cache/brave-profile/Default/DawnWebGPUCache')
+            backups = list((self.root / 'cache-backups').glob('*/DawnWebGPUCache/some-test-file'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), b'production reproduction fixture')
+            self.assertTrue(backups[0].is_relative_to(self.root))
+            self.assertFalse(backups[0].is_relative_to(self.home))
+            self.assertFalse(any(p.name == 'cache-backups' for p in self.home.rglob('*')))
+            timestamp = path.lstat().st_mtime_ns
+            tool.main(['prepare'])
+            self.assertEqual(timestamp, path.lstat().st_mtime_ns)
+            self.assertEqual(backups, list((self.root / 'cache-backups').glob('*/DawnWebGPUCache/some-test-file')))
+            with mock.patch.object(tool.os, 'execve') as execute:
+                tool.open_app(self.root, 'brave', [])
+                execute.assert_called_once()
+        self.assertIn('Relocating stopped Brave cache:', output.getvalue())
+        self.assertIn(str(backups[0].parent), output.getvalue())
+
+    def test_unknown_and_unknown_dawn_cache_names_refused(self):
+        for name in ['Unknown', 'DawnFutureCache', 'DawnWebGPUCacheExtra']:
+            path = tool.BRAVE / 'Default' / name
+            path.mkdir(parents=True)
+            (path / 'important').write_text('keep')
+            with self.subTest(name=name), mock.patch.object(tool, 'stopped') as stopped:
+                with self.assertRaisesRegex(RuntimeError, 'left intact'):
+                    tool.brave_cache_link(path, self.root / 'cache/test', self.root)
+                stopped.assert_not_called()
+            self.assertFalse(path.is_symlink())
+            self.assertEqual((path / 'important').read_text(), 'keep')
+        self.assertFalse((self.root / 'cache-backups').exists())
 
     def test_running_brave_blocks_open_without_losing_contents(self):
         self.native_fixture('brave')
@@ -158,9 +204,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual((path / 'generated').read_text(), 'keep')
         self.assertFalse(path.is_symlink())
 
-    def test_unknown_cache_directory_and_wrong_link_refuse_actual_brave_open(self):
+    def test_nonrelocatable_cache_directory_and_wrong_link_refuse_actual_brave_open(self):
         self.native_fixture('brave')
-        path = tool.BRAVE / 'Default/DawnWebGPUCache'  # deliberately outside relocation allowlist
+        path = tool.BRAVE / 'Default/Crashpad'  # deliberately outside relocation allowlist
         path.mkdir(parents=True)
         (path / 'generated').write_text('keep')
         with mock.patch.object(tool.os, 'execve') as execute:

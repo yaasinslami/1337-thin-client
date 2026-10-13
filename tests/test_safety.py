@@ -1,3 +1,4 @@
+import errno
 import contextlib
 import hashlib
 import importlib.machinery
@@ -180,6 +181,239 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             tool.cache_link(path, self.root / 'cache')
         self.assertEqual((path / 'important').read_text(), 'keep')
+
+    def native_fixture(self, app):
+        profile = tool.BRAVE if app == 'brave' else tool.CODE
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / '.thin-client-import').write_text('prepared fixture')
+        exe = self.root / ('apps/brave/current/brave' if app == 'brave'
+                           else 'apps/vscode/current/bin/code')
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_text('fixture')
+        exe.chmod(0o755)
+        return exe
+
+    def test_open_code_friend_reproduction_never_inspects_brave(self):
+        self.native_fixture('code')
+        self.native_fixture('brave')
+        cache = tool.BRAVE / 'Default/DawnGraphiteCache'
+        cache.mkdir(parents=True)
+        (cache / 'generated').write_text('keep')
+        original_stat = Path.stat
+        def guard(path, *args, **kwargs):
+            if path == tool.BRAVE or tool.BRAVE in path.parents:
+                self.fail(f'Code inspected Brave: {path}')
+            return original_stat(path, *args, **kwargs)
+        with mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(Path, 'stat', guard), \
+             mock.patch.object(tool, 'brave_caches', side_effect=AssertionError('Brave touched')), \
+             mock.patch.object(tool.os, 'execve') as execute:
+            tool.main(['open', 'code'])
+            execute.assert_called_once()
+        self.assertFalse(cache.is_symlink())
+        self.assertEqual((cache / 'generated').read_text(), 'keep')
+        self.assertTrue((self.root / 'vscode-extensions').is_dir())
+
+    def test_open_brave_never_inspects_code(self):
+        self.native_fixture('brave')
+        tool.CODE.mkdir(parents=True)
+        (tool.CODE / 'GPUCache').mkdir()
+        # Even an invalid extension destination must not block Brave.
+        (self.root / 'vscode-extensions').write_text('unexpected')
+        original_stat = Path.stat
+        def guard(path, *args, **kwargs):
+            if path == tool.CODE or tool.CODE in path.parents:
+                self.fail(f'Brave inspected Code: {path}')
+            return original_stat(path, *args, **kwargs)
+        with mock.patch.object(Path, 'stat', guard), \
+             mock.patch.object(tool, 'vscode_caches', side_effect=AssertionError('Code touched')), \
+             mock.patch.object(tool.os, 'execve') as execute:
+            tool.open_app(self.root, 'brave', [])
+            execute.assert_called_once()
+
+    def test_code_launches_without_brave_profile_or_binary(self):
+        self.native_fixture('code')
+        with mock.patch.object(tool.os, 'execve') as execute:
+            tool.open_app(self.root, 'code', [])
+            execute.assert_called_once()
+        self.assertFalse(tool.BRAVE.exists())
+        self.assertFalse((self.root / 'apps/brave').exists())
+
+    def test_brave_launches_without_code_profile_or_binary(self):
+        self.native_fixture('brave')
+        with mock.patch.object(tool.os, 'execve') as execute:
+            tool.open_app(self.root, 'brave', [])
+            execute.assert_called_once()
+        self.assertFalse(tool.CODE.exists())
+        self.assertFalse((self.root / 'apps/vscode').exists())
+        self.assertFalse((self.root / 'vscode-extensions').exists())
+
+    def test_known_brave_caches_preserved_then_linked(self):
+        for name in sorted(tool.BRAVE_RELOCATABLE_CACHES):
+            cache = tool.BRAVE / 'Default' / name
+            cache.mkdir(parents=True)
+            (cache / 'generated').write_text(name)
+        with self.fake_mount(), mock.patch.object(tool, 'stopped') as stopped:
+            tool.brave_caches(self.root)
+            self.assertEqual(stopped.call_count, len(tool.BRAVE_RELOCATABLE_CACHES))
+            stopped.assert_called_with(('brave',))
+            tool.brave_caches(self.root)
+            self.assertEqual(stopped.call_count, len(tool.BRAVE_RELOCATABLE_CACHES))
+        # Every original cache payload is retained outside the browser profile.
+        preserved = {p.read_text() for p in (self.root / 'cache-backups').glob('*/*/generated')}
+        self.assertEqual(preserved, tool.BRAVE_RELOCATABLE_CACHES)
+        for backup in (self.root / 'cache-backups').glob('*/*'):
+            self.assertTrue(backup.is_relative_to(self.root))
+            self.assertFalse(backup.is_relative_to(self.home))
+        self.assertFalse((tool.STATE / 'cache-backups').exists())
+        for name in tool.BRAVE_RELOCATABLE_CACHES:
+            self.assertTrue((tool.BRAVE / 'Default' / name).is_symlink())
+
+    def test_brave_backup_rejects_arbitrary_home_root(self):
+        cache = tool.BRAVE / 'Default/GPUCache'
+        cache.mkdir(parents=True)
+        (cache / 'generated').write_text('keep')
+        for root in [self.home / 'thin-client', self.home / 'arbitrary/thin-client']:
+            root.mkdir(parents=True)
+            with self.subTest(root=root), mock.patch.object(tool, 'stopped'):
+                with self.assertRaises(RuntimeError):
+                    tool.brave_cache_link(cache, self.root / 'cache/test', root)
+            self.assertEqual((cache / 'generated').read_text(), 'keep')
+            self.assertFalse((root / 'cache-backups').exists())
+
+    def test_brave_backup_symlink_into_home_refused(self):
+        cache = tool.BRAVE / 'Default/GPUCache'
+        cache.mkdir(parents=True)
+        (cache / 'generated').write_text('keep')
+        destination = self.home / 'arbitrary-backups'
+        destination.mkdir()
+        (self.root / 'cache-backups').symlink_to(destination)
+        with self.fake_mount(), mock.patch.object(tool, 'stopped'):
+            with self.assertRaises(RuntimeError):
+                tool.brave_cache_link(cache, self.root / 'cache/test', self.root)
+        self.assertEqual((cache / 'generated').read_text(), 'keep')
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_brave_backup_cross_filesystem_move_preserves_contents(self):
+        cache = tool.BRAVE / 'Default/GPUCache'
+        cache.mkdir(parents=True)
+        (cache / 'generated').write_text('keep')
+        (cache / 'nested-link').symlink_to('generated')
+        with self.fake_mount(), mock.patch.object(tool, 'stopped'), \
+             mock.patch.object(tool.os, 'rename', side_effect=OSError(errno.EXDEV, 'cross-device')):
+            tool.brave_cache_link(cache, self.root / 'cache/test', self.root)
+        backup = next((self.root / 'cache-backups').glob('*/GPUCache'))
+        self.assertEqual((backup / 'generated').read_text(), 'keep')
+        self.assertEqual(os.readlink(backup / 'nested-link'), 'generated')
+        self.assertTrue(cache.is_symlink())
+
+    def test_failed_brave_backup_copy_preserves_source(self):
+        cache = tool.BRAVE / 'Default/GPUCache'
+        cache.mkdir(parents=True)
+        (cache / 'generated').write_text('keep')
+        with self.fake_mount(), mock.patch.object(tool, 'stopped'), \
+             mock.patch.object(tool.os, 'rename', side_effect=OSError(errno.EXDEV, 'cross-device')), \
+             mock.patch.object(tool.shutil, 'copytree', side_effect=OSError('copy failed')):
+            with self.assertRaises(OSError):
+                tool.brave_cache_link(cache, self.root / 'cache/test', self.root)
+        self.assertFalse(cache.is_symlink())
+        self.assertEqual((cache / 'generated').read_text(), 'keep')
+
+    def test_running_brave_cache_relocation_refused(self):
+        cache = tool.BRAVE / 'Default/GPUCache'
+        cache.mkdir(parents=True)
+        (cache / 'generated').write_text('keep')
+        with self.fake_mount(), mock.patch.object(tool, 'stopped', side_effect=RuntimeError('running')):
+            with self.assertRaises(RuntimeError):
+                tool.brave_caches(self.root)
+        self.assertFalse(cache.is_symlink())
+        self.assertEqual((cache / 'generated').read_text(), 'keep')
+
+    def test_brave_unknown_or_persistent_paths_refused(self):
+        for relative in ['Default/Unknown', 'Default/IndexedDB', 'Default/Local Storage',
+                         'Default/Service Worker/CacheStorage', 'Default/Extensions/Cache',
+                         'Profile custom/GPUCache']:
+            with self.subTest(relative=relative):
+                path = tool.BRAVE / relative
+                path.mkdir(parents=True)
+                (path / 'important').write_text('keep')
+                with self.assertRaises(RuntimeError):
+                    tool.brave_cache_link(path, self.root / 'cache/test', self.root)
+                self.assertFalse(path.is_symlink())
+                self.assertEqual((path / 'important').read_text(), 'keep')
+
+    def test_brave_persistent_data_and_nested_cache_names_untouched(self):
+        tool.BRAVE.mkdir(parents=True)
+        persistent = ['Local State', 'Default/History', 'Default/Bookmarks',
+                      'Default/Preferences', 'Default/Login Data',
+                      'Default/IndexedDB/site/Cache/important',
+                      'Default/Local Storage/important',
+                      'Default/Extensions/id/Cache/important']
+        for relative in persistent:
+            path = tool.BRAVE / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('persistent fixture')
+        with self.fake_mount(), mock.patch.object(tool, 'stopped') as stopped:
+            tool.brave_caches(self.root)
+            stopped.assert_not_called()
+        for relative in persistent:
+            self.assertEqual((tool.BRAVE / relative).read_text(), 'persistent fixture')
+        self.assertFalse((tool.STATE / 'cache-backups').exists())
+
+    def test_brave_cache_mount_refused(self):
+        cache = tool.BRAVE / 'GPUCache'
+        cache.mkdir(parents=True)
+        with mock.patch.object(Path, 'is_mount', return_value=True):
+            with self.assertRaises(RuntimeError):
+                tool.brave_cache_link(cache, self.root / 'cache/test', self.root)
+        self.assertFalse(cache.is_symlink())
+
+    def test_brave_cache_file_refused(self):
+        tool.BRAVE.mkdir(parents=True)
+        path = tool.BRAVE / 'GPUCache'
+        path.write_text('keep')
+        with self.assertRaises(RuntimeError):
+            tool.brave_cache_link(path, self.root / 'cache/test', self.root)
+        self.assertEqual(path.read_text(), 'keep')
+
+    def test_brave_symlink_ancestor_refused(self):
+        tool.BRAVE.mkdir(parents=True)
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'GPUCache').mkdir()
+        (tool.BRAVE / 'Default').symlink_to(outside)
+        with self.assertRaises(RuntimeError):
+            tool.brave_caches(self.root)
+        self.assertFalse((outside / 'GPUCache').is_symlink())
+
+    def test_unexpected_cache_symlink_refused(self):
+        for broken in [False, True]:
+            with self.subTest(broken=broken):
+                path = self.home / ('broken' if broken else 'wrong')
+                target = self.base / ('missing' if broken else 'outside')
+                if not broken:
+                    target.mkdir()
+                path.symlink_to(target)
+                with self.assertRaises(RuntimeError):
+                    tool.cache_link(path, self.root / 'cache/test')
+                self.assertEqual(os.readlink(path), str(target))
+
+    def test_prepare_idempotent_and_recreates_lost_cache_targets(self):
+        with mock.patch.object(tool, 'goinfre', return_value=self.root), \
+             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'install'), \
+             mock.patch.object(tool, 'stopped'), mock.patch.object(tool, 'run'), \
+             mock.patch.object(tool, 'desktop_integration'):
+            tool.main(['prepare'])
+            (tool.BRAVE / 'Default').mkdir()
+            tool.main(['prepare'])
+            link = tool.BRAVE / 'Default/DawnGraphiteCache'
+            timestamp = link.lstat().st_mtime_ns
+            tool.main(['prepare'])
+            self.assertEqual(link.lstat().st_mtime_ns, timestamp)
+            tool.shutil.rmtree(self.root / 'cache')
+            tool.main(['prepare'])
+            self.assertTrue(link.is_dir())
+            self.assertTrue((tool.CODE / 'GPUCache').is_dir())
 
     def test_download_host_allowlist(self):
         self.assertEqual(tool.url_checked('https://github.com/brave/example'), 'https://github.com/brave/example')

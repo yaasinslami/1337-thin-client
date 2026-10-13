@@ -189,8 +189,30 @@ No GPU forcing or sandbox-disabling flags are added.
 VS Code's persistent user-data directory, including unsaved-file backups, remains
 in HOME. Only specifically named generated cache/log directories use links into
 goinfre; extensions use the supported CLI directory option. Existing non-link
-cache contents are never silently replaced. Missing cache destinations are
-recreated at launch; unexpected links/data cause a clear failure.
+cache contents are never silently replaced. Each launcher prepares only its own
+application's caches and state; Brave does not require Code's extension directory.
+Missing cache destinations are recreated at launch; unexpected links/data cause
+a clear failure.
+
+Existing real Brave cache directories named `DawnGraphiteCache`, `GPUCache`,
+`Code Cache`, `Cache`, `GrShaderCache`, or `ShaderCache` can be redirected after
+Brave is fully stopped. Only exact locations directly under the Brave root,
+`Default`, or `Profile <number>` qualify; symlink ancestors and mount points are
+refused. The directory is relocated to a unique backup under the validated
+`<goinfre>/thin-client/cache-backups/`, its location is printed, then the
+cache link is created. Cross-filesystem relocation copies the contents before
+removing the original cache directory; a copy failure preserves the source.
+Backups remain in disposable goinfre for manual review and are never
+automatically pruned. No backup is stored in HOME. Other
+existing directories/files and unexpected links are preserved and refused.
+Persistent site databases and nested directories with cache-like names do not
+qualify. Full `migrate`, `integrate`, and `prepare` still prepare both apps.
+
+After updating a reviewed checkout, `./thin-client-setup desktop` updates the
+installed setup script and launchers without downloads or profile migration.
+Existing prepared users need no additional migration command: Code launches
+independently immediately, and the next Brave launch redirects the allowlisted
+existing caches if Brave is stopped.
 
 Prior application releases and downloads are retained for rollback. Audit their
 space periodically; this tool does not silently prune them.

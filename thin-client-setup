@@ -38,6 +38,8 @@ CACHE_NAMES = {'Cache', 'Code Cache', 'GPUCache', 'GPUPersistentCache',
                'DawnGraphiteCache', 'DawnWebGPUCache', 'CacheStorage',
                'ScriptCache', 'component_crx_cache', 'extensions_crx_cache',
                'Crash Reports', 'Crashpad', 'BrowserMetrics', 'BrowserMetrics-spare.pma'}
+BRAVE_RELOCATABLE_CACHES = {'DawnGraphiteCache', 'GPUCache', 'Code Cache',
+                            'Cache', 'GrShaderCache', 'ShaderCache'}
 CODE_CACHES = ['Cache', 'Code Cache', 'CachedData', 'CachedProfilesData',
                'CachedExtensionVSIXs', 'GPUCache', 'DawnGraphiteCache',
                'DawnWebGPUCache', 'logs', 'Crashpad']
@@ -320,6 +322,7 @@ def install(root):
     install_app(root, 'vscode', meta['productVersion'], meta['url'], meta['sha256hash'], 'tar', work)
 
 def cache_link(path, target):
+    safe(path.parent)
     safe(target).mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         if path.resolve() != target.resolve():
@@ -330,19 +333,52 @@ def cache_link(path, target):
         safe(path.parent).mkdir(parents=True, exist_ok=True)
         path.symlink_to(target)
 
-def caches(root):
-    # Only new, explicitly disposable paths are linked. Never relocate existing data.
+def vscode_caches(root):
+    safe(CODE)
     for name in CODE_CACHES:
         cache_link(CODE / name, root / 'cache/vscode' / name)
+
+def brave_cache_link(path, target, root):
+    """Preserve allowlisted caches in goinfre before redirecting exact locations."""
+    safe(BRAVE)
+    safe(path.parent)
+    relative = path.relative_to(BRAVE)
+    parts = relative.parts
+    profile_cache = (len(parts) == 1 or
+                     (len(parts) == 2 and (parts[0] == "Default" or
+                                           re.fullmatch(r"Profile [0-9]+", parts[0]))))
+    if path.exists() and not path.is_symlink():
+        if (not profile_cache or path.name not in BRAVE_RELOCATABLE_CACHES or
+                not path.is_dir() or path.is_mount()):
+            raise RuntimeError(f'Existing data blocks cache redirection (left intact): {path}')
+        if root.name != 'thin-client':
+            raise RuntimeError(f'Unexpected thin-client root: {root}')
+        validate_goinfre(root.parent, HOME)
+        safe(root)
+        safe(target).mkdir(parents=True, exist_ok=True)
+        stopped(('brave',))
+        safe(path)
+        backups = safe(root / 'cache-backups')
+        backups.mkdir(parents=True, exist_ok=True)
+        backup = Path(tempfile.mkdtemp(prefix='brave-', dir=backups)) / path.name
+        # HOME and goinfre are separate filesystems: copy before removing the
+        # source. shutil.move preserves nested symlinks and retains the source
+        # if copying fails; backups are never automatically pruned.
+        shutil.move(str(path), str(backup))
+        print(f'Preserved Brave cache: {path} -> {backup}', flush=True)
+    cache_link(path, target)
+
+def brave_caches(root):
+    safe(BRAVE)
     if BRAVE.is_dir():
         for parent in [BRAVE, *[p for p in BRAVE.iterdir() if p.is_dir() and
-                       (p.name == 'Default' or p.name.startswith('Profile '))]]:
+                       (p.name == 'Default' or re.fullmatch(r'Profile [0-9]+', p.name))]]:
             for name in sorted(CACHE_NAMES - {'BrowserMetrics-spare.pma', 'ScriptCache', 'CacheStorage'}):
-                cache_link(parent / name, root / 'cache/brave-profile' / parent.relative_to(BRAVE) / name)
+                brave_cache_link(parent / name, root / 'cache/brave-profile' / parent.relative_to(BRAVE) / name, root)
             if parent != BRAVE:
                 for name in ['ScriptCache', 'CacheStorage']:
-                    cache_link(parent / 'Service Worker' / name,
-                               root / 'cache/brave-profile' / parent.name / 'Service Worker' / name)
+                    brave_cache_link(parent / 'Service Worker' / name,
+                               root / 'cache/brave-profile' / parent.name / 'Service Worker' / name, root)
 
 def migrate(root):
     stopped()
@@ -361,7 +397,8 @@ def migrate(root):
             migrate_brave(stage)
     if not (CODE / '.thin-client-import').exists():
         migrate_code()
-    caches(root)
+    vscode_caches(root)
+    brave_caches(root)
 
 def migrate_brave(stage):
     safe(OLD_BRAVE)
@@ -430,7 +467,10 @@ def environment(root, app):
     env['XDG_CONFIG_HOME'] = str(HOME / '.config')
     env['XDG_CACHE_HOME'] = str(root / 'cache' / app)
     env['TMPDIR'] = str(root / 'tmp')
-    for p in [root / 'cache' / app, root / 'tmp', root / 'vscode-extensions']:
+    paths = [root / 'cache' / app, root / 'tmp']
+    if app == 'vscode':
+        paths.append(root / 'vscode-extensions')
+    for p in paths:
         safe(p).mkdir(parents=True, exist_ok=True)
     return env
 
@@ -442,7 +482,8 @@ def integrate(root):
     if not (CODE / '.thin-client-import').exists() or not (BRAVE / '.thin-client-import').exists():
         raise RuntimeError('Complete migration before integration')
     stopped()
-    caches(root)
+    vscode_caches(root)
+    brave_caches(root)
     env = environment(root, 'vscode')
     for ext in EXTENSIONS:
         run([*code_args(root), '--install-extension', ext], env=env)
@@ -500,7 +541,8 @@ def open_app(root, app, args):
     profile = BRAVE if app == 'brave' else CODE
     if not (profile / '.thin-client-import').exists():
         raise RuntimeError('Profile not prepared: run thin-client-setup migrate/integrate')
-    caches(root)
+    safe(profile)
+    (brave_caches if app == 'brave' else vscode_caches)(root)
     env = environment(root, app if app == 'brave' else 'vscode')
     if app == 'brave':
         argv = [exe, f'--user-data-dir={BRAVE}', '--class=brave-native', '--disk-cache-size=104857600', *args]

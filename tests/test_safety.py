@@ -129,10 +129,10 @@ class SafetyTests(unittest.TestCase):
         root = self.root.parent
         def replacement(path, *args, **kwargs):
             result = original(path, *args, **kwargs)
-            if path == root:
+            if path == root or root in path.parents:
                 data = list(result)
                 data[2] += 1
-                if uid is not None:
+                if path == root and uid is not None:
                     data[4] = uid
                 return os.stat_result(data)
             return result

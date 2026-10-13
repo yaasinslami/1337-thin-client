@@ -292,10 +292,56 @@ An unapproved path is never offered to cache-link setup. A direct attempt to
 manage one is refused before cache validation. No `Dawn*` or `*Cache*` pattern
 grants relocation permission.
 
-This update does not rewrite old Service Worker symlinks or re-import an existing
-native profile. If an older setup already redirected or omitted site state,
-review the retained Flatpak source or backup before restoring it with Brave
-stopped. Existing browser/site data is never overwritten automatically.
+Normal preparation does not rewrite old Service Worker symlinks or re-import an
+existing native profile. The explicit legacy repair below can restore recognized
+links whose data still exists. If an older import omitted site state, review the
+retained Flatpak source or backup; existing browser/site data is never overwritten
+automatically.
+
+### Repairing old Service Worker links
+
+Older versions could incorrectly redirect persistent `Service Worker/ScriptCache`
+and `Service Worker/CacheStorage` into goinfre. This state can exist on accounts
+prepared by those releases. `status` detects recognized links and recommends the
+explicit `repair-legacy` command; `prepare` never performs this repair implicitly.
+
+After updating the reviewed checkout, inspect without changing anything:
+
+```sh
+./thin-client-setup status
+./thin-client-setup repair-legacy --dry-run
+```
+
+For an existing installation, first update the installed script using the
+checkout's `./thin-client-setup install-self`. Then fully quit Brave, including
+background processes, and explicitly repair:
+
+```sh
+~/.local/bin/thin-client-setup repair-legacy
+```
+
+Only `Default` and `Profile <number>` links at the two exact Service Worker paths
+qualify. The link must point directly to the corresponding old project layout:
+`<validated goinfre>/thin-client/cache/brave-profile/<profile>/Service Worker/<name>`.
+An arbitrary external target, unrelated goinfre path, another profile's target,
+symlink ancestor, mount, or external indirection is refused. Normal directories,
+registration databases, other site storage and unknown symlink locations are
+never replaced.
+
+Repair copies the existing target into private HOME-side staging, checks file
+sizes/hashes and directory structure, checks that the source stayed unchanged,
+and checks Brave is still stopped before publishing the complete directory by
+a same-filesystem rename. The original link is retained temporarily for rollback
+if publication fails. The old goinfre directory is left intact. Repair logs paths
+only and is idempotent; successfully published staging directories are cleaned
+up. Verification/copy failures leave the link and source intact and retain staging
+for inspection. HOME needs space for the complete persistent copy.
+
+**Broken known links are refused, not replaced with invented empty state.** The
+old data is unavailable, and an empty ScriptCache cannot restore scripts referenced
+by registration metadata. Recover the exact target from a persistent backup before
+retrying, or manually review the lost site state. Diagnostics report missing
+targets; repair does not silently reset browser registrations or offline data.
 
 Prior application releases and downloads are retained for rollback. Audit their
 space periodically; this tool does not silently prune them.

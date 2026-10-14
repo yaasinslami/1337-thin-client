@@ -194,6 +194,10 @@ class SafetyTests(unittest.TestCase):
         source.write_bytes(base64.b64decode(
             'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='))
         (self.root / 'apps/vscode/current').symlink_to(release, target_is_directory=True)
+        brave = self.root / 'apps/brave/releases/fixture'
+        brave.mkdir(parents=True, exist_ok=True)
+        (brave / 'product_logo_256.png').write_bytes(source.read_bytes())
+        (self.root / 'apps/brave/current').symlink_to(brave, target_is_directory=True)
         return source
 
     def native_fixture(self, app):

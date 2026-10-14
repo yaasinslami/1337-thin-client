@@ -220,28 +220,38 @@ native Brave -> vscode:// callback -> code-native-url-handler.desktop
              -> code-native --open-url <callback> -> Code-Thin
 ```
 
-Desktop setup copies the official PNG bundled in the installed native Code
-release into `~/.local/share/icons/hicolor/<size>x<size>/apps/code-native.png`.
-The size comes from the bundled image (currently 1024×1024); no icon is downloaded
-or borrowed from Flatpak. Both Code entries use the absolute persistent PNG path
-in `Icon=` to avoid dependency on GNOME icon-theme lookup. `prepare`,
-`integrate`, and `desktop` restore a missing icon and refresh user icon/desktop
-caches when the corresponding utilities are available. `desktop` requires the
-native Code release to be present; use `prepare` first on a new workstation.
+Desktop setup copies each application's official bundled PNG into persistent
+`~/.local/share/icons/hicolor/<size>x<size>/apps/`:
+
+- Brave: `product_logo_256.png` → `256x256/apps/brave-native.png` (currently 256×256).
+- Code: `resources/app/resources/linux/code.png` → `1024x1024/apps/code-native.png`
+  (currently 1024×1024).
+
+The directory size comes from each PNG; bytes are copied unchanged, without
+separate downloads or system/Flatpak icon dependencies. Both native launchers
+and the hidden Code callback entry use absolute persistent `Icon=` paths, so
+GNOME icon-theme lookup and changing posts do not break their icons. `prepare`,
+`integrate`, and `desktop` restore missing icons and refresh user icon/desktop
+caches when the corresponding utilities are available. `desktop` requires both
+native releases to be present; use `prepare` first on a new workstation.
 Cache refresh is best-effort; missing or failing optional utilities do not block
 setup. If GNOME still shows stale results, logout/login refreshes its shell cache.
 
 Desktop setup preserves or creates user-level `Hidden=true` overrides for
 `com.brave.Browser.desktop`, `org.mozilla.firefox.desktop`, and
-`com.visualstudio.code.desktop`. It also discovers Microsoft Visual Studio Code
+`com.visualstudio.code.desktop`. It also discovers system Brave and Microsoft Visual Studio Code
 entries in standard system/XDG and Flatpak application directories and masks their
-actual desktop IDs (for example `code.desktop`). Detection requires exact Code
+actual desktop IDs (for example `code.desktop` or `brave-browser.desktop`).
+Code detection requires exact Code
 identity in the main desktop group: `Name=Visual Studio Code`,
-`X-Flatpak=com.visualstudio.code`, or the known Flatpak desktop ID. It never uses
+`X-Flatpak=com.visualstudio.code`, or the known Flatpak desktop ID. Brave detection requires its exact Flatpak
+identity, or an exact reviewed Brave name paired with a Brave executable
+(`brave`, `brave-browser`, or `brave-browser-stable`). Chrome, Chromium and native
+thin-client launchers are excluded. Detection never uses
 substring matching, masks native thin-client launchers, changes system files,
 uninstalls software, or hides unrelated editors such as Code::Blocks. Existing
 unmanaged user launchers with conflicting IDs are refused rather than overwritten.
-`status` and `doctor` report the persistent icon target and detected Code masks.
+`status` and `doctor` report the persistent icon targets and detected Brave/Code masks.
 
 The normal `code-native.desktop` entry remains a file/folder launcher using `%F`.
 Only the dedicated callback entry registers `x-scheme-handler/vscode`, with

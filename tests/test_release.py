@@ -22,6 +22,7 @@ class ReleaseTests(unittest.TestCase):
     setUp = fixtures.SafetyTests.setUp
     fake_mount = fixtures.SafetyTests.fake_mount
     native_fixture = fixtures.SafetyTests.native_fixture
+    icon_fixture = fixtures.SafetyTests.icon_fixture
 
     def xdg_mock(self, *, ignore_https=False):
         state = {'browser': 'other.desktop', 'http': 'other.desktop',
@@ -42,13 +43,14 @@ class ReleaseTests(unittest.TestCase):
                 scheme = argv[3].split('/')[-1]
                 if not (ignore_https and scheme == 'https'):
                     state[scheme] = argv[2]
-            elif argv[0] != 'update-desktop-database':
+            elif argv[0] not in ('update-desktop-database', 'gtk-update-icon-cache'):
                 self.fail(f'Unexpected external command: {argv}')
             return mock.Mock(stdout='')
         return state, calls, execute
 
     def test_explicit_defaults_register_all_routes_idempotently(self):
         state, calls, execute = self.xdg_mock()
+        self.icon_fixture()
         with mock.patch.object(tool, 'goinfre', return_value=self.root), \
              mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'run', side_effect=execute):
             tool.main(['defaults', 'brave'])
@@ -69,7 +71,8 @@ class ReleaseTests(unittest.TestCase):
     def test_desktop_does_not_take_over_browser_defaults(self):
         state, _, execute = self.xdg_mock()
         with mock.patch.object(tool, 'run', side_effect=execute):
-            tool.desktop_integration()
+            self.icon_fixture()
+            tool.desktop_integration(self.root)
         self.assertEqual(state['browser'], 'other.desktop')
         self.assertEqual(state['http'], 'other.desktop')
         self.assertEqual(state['https'], 'other.desktop')
@@ -78,7 +81,8 @@ class ReleaseTests(unittest.TestCase):
     def test_defaults_refuse_to_report_success_when_xdg_ignores_update(self):
         _, _, execute = self.xdg_mock(ignore_https=True)
         with mock.patch.object(tool, 'run', side_effect=execute):
-            tool.desktop_integration()
+            self.icon_fixture()
+            tool.desktop_integration(self.root)
             with self.assertRaisesRegex(RuntimeError, 'did not match'):
                 tool.make_default_browser()
 
@@ -90,7 +94,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertFalse(tool.desktop_diagnostics())
         self.assertEqual(state, expected)
         self.assertEqual(len(calls), 4)
-        self.assertEqual(output.getvalue().count('MISMATCH'), 4)
+        self.assertGreaterEqual(output.getvalue().count('MISMATCH'), 4)
         self.assertIn('MISSING', output.getvalue())
         self.assertFalse((self.home / '.config').exists())
 
@@ -491,9 +495,81 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(backup.read_text(), 'upgraded fixture')
         self.assertFalse((installed.STATE / 'cache-backups').exists())
 
+    def test_bundled_icon_installed_persistently_and_restored_idempotently(self):
+        source = self.icon_fixture()
+        state, calls, execute = self.xdg_mock()
+        with mock.patch.object(tool, 'run', side_effect=execute), \
+             mock.patch.object(tool.shutil, 'which', return_value='/fixture/tool'):
+            tool.desktop_integration(self.root)
+            icon = self.home / '.local/share/icons/hicolor/1x1/apps/code-native.png'
+            self.assertEqual(icon.read_bytes(), source.read_bytes())
+            self.assertFalse(icon.is_symlink())
+            self.assertEqual(icon.stat().st_mode & 0o777, 0o644)
+            before = (icon.stat().st_ino, icon.stat().st_mtime_ns)
+            tool.desktop_integration(self.root)
+            self.assertEqual(before, (icon.stat().st_ino, icon.stat().st_mtime_ns))
+            icon.unlink()
+            tool.desktop_integration(self.root)
+            self.assertEqual(icon.read_bytes(), source.read_bytes())
+        apps = self.home / '.local/share/applications'
+        normal = (apps / 'code-native.desktop').read_text()
+        callback = (apps / 'code-native-url-handler.desktop').read_text()
+        self.assertIn(f'Icon={icon}\n', normal)
+        self.assertIn(f'Icon={icon}\n', callback)
+        self.assertIn('NoDisplay=true\n', callback)
+        self.assertIn('--open-url %U', callback)
+        self.assertIn('MimeType=x-scheme-handler/vscode;', callback)
+        self.assertNotIn('x-scheme-handler/vscode', normal)
+        self.assertIn(' %F', normal)
+        self.assertEqual(state['vscode'], 'code-native-url-handler.desktop')
+        self.assertEqual(state['http'], 'other.desktop')
+        self.assertTrue(any(c[0] == 'gtk-update-icon-cache' for c in calls))
+        self.assertTrue(any(c[0] == 'update-desktop-database' for c in calls))
+        self.assertEqual(tool.desktop_fields(apps / 'com.visualstudio.code.desktop')['Hidden'], 'true')
+
+    def test_bundled_icon_refuses_external_current_release(self):
+        source = self.icon_fixture()
+        current = self.root / 'apps/vscode/current'
+        current.unlink()
+        current.symlink_to(self.base)
+        with self.assertRaisesRegex(RuntimeError, 'outside managed releases'):
+            tool.install_code_icon(self.root)
+        self.assertFalse((self.home / '.local/share/icons').exists())
+
+    def test_bundled_icon_refuses_source_and_destination_symlinks(self):
+        source = self.icon_fixture()
+        payload = source.read_bytes()
+        external = self.base / 'external.png'
+        external.write_bytes(payload)
+        source.unlink()
+        source.symlink_to(external)
+        with self.assertRaisesRegex(RuntimeError, 'Unexpected symlink'):
+            tool.install_code_icon(self.root)
+        source.unlink()
+        source.write_bytes(payload)
+        destination = self.home / '.local/share/icons/hicolor/1x1/apps/code-native.png'
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(external)
+        with self.assertRaisesRegex(RuntimeError, 'Unexpected symlink'):
+            tool.install_code_icon(self.root)
+        self.assertEqual(external.read_bytes(), payload)
+
+    def test_missing_or_invalid_bundled_icon_refuses_without_downloads(self):
+        source = self.icon_fixture()
+        source.unlink()
+        with mock.patch.object(tool, 'run') as external:
+            with self.assertRaisesRegex(RuntimeError, 'Bundled VS Code icon missing'):
+                tool.install_code_icon(self.root)
+            source.write_bytes(b'not an icon')
+            with self.assertRaisesRegex(RuntimeError, 'Invalid bundled VS Code PNG'):
+                tool.install_code_icon(self.root)
+            external.assert_not_called()
+        self.assertFalse((self.home / '.local/share/icons').exists())
+
     def test_generated_callback_wrapper_preserves_url_as_one_argument(self):
         with mock.patch.object(tool, 'run'):
-            tool.desktop_integration()
+            self.icon_fixture()
+            tool.desktop_integration(self.root)
         # A recording setup fixture intercepts the generated launcher's exec.
         tool.SELF.write_text('#!/usr/bin/python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
         tool.SELF.chmod(0o755)

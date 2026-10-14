@@ -220,6 +220,29 @@ native Brave -> vscode:// callback -> code-native-url-handler.desktop
              -> code-native --open-url <callback> -> Code-Thin
 ```
 
+Desktop setup copies the official PNG bundled in the installed native Code
+release into `~/.local/share/icons/hicolor/<size>x<size>/apps/code-native.png`.
+The size comes from the bundled image (currently 1024×1024); no icon is downloaded
+or borrowed from Flatpak. Both Code entries use the absolute persistent PNG path
+in `Icon=` to avoid dependency on GNOME icon-theme lookup. `prepare`,
+`integrate`, and `desktop` restore a missing icon and refresh user icon/desktop
+caches when the corresponding utilities are available. `desktop` requires the
+native Code release to be present; use `prepare` first on a new workstation.
+Cache refresh is best-effort; missing or failing optional utilities do not block
+setup. If GNOME still shows stale results, logout/login refreshes its shell cache.
+
+Desktop setup preserves or creates user-level `Hidden=true` overrides for
+`com.brave.Browser.desktop`, `org.mozilla.firefox.desktop`, and
+`com.visualstudio.code.desktop`. It also discovers Microsoft Visual Studio Code
+entries in standard system/XDG and Flatpak application directories and masks their
+actual desktop IDs (for example `code.desktop`). Detection requires exact Code
+identity in the main desktop group: `Name=Visual Studio Code`,
+`X-Flatpak=com.visualstudio.code`, or the known Flatpak desktop ID. It never uses
+substring matching, masks native thin-client launchers, changes system files,
+uninstalls software, or hides unrelated editors such as Code::Blocks. Existing
+unmanaged user launchers with conflicting IDs are refused rather than overwritten.
+`status` and `doctor` report the persistent icon target and detected Code masks.
+
 The normal `code-native.desktop` entry remains a file/folder launcher using `%F`.
 Only the dedicated callback entry registers `x-scheme-handler/vscode`, with
 `--open-url %U`. External HTTP/HTTPS URLs use `brave-native.desktop`, and

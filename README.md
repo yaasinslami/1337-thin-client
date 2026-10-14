@@ -21,7 +21,8 @@ HOME                              GOINFRE (disposable)
   shell/Git config (untouched)       thin-client/apps/*/current
   .config/BraveSoftware/             thin-client/cache/
     Brave-Browser/                  thin-client/vscode-extensions/
-  .config/Code-Thin/                 thin-client/tmp/
+  .config/Code-Thin/                 thin-client/runtime/brave/{config,cache}/
+                                    thin-client/tmp/
   .local/bin/ launch/setup scripts   thin-client/legacy-backups/
           |
           +-- VS Code Remote SSH --> optional remote server
@@ -45,13 +46,17 @@ explicitly from a normal host terminal:
 
 ```sh
 ~/.local/bin/thin-client-setup status
-~/.local/bin/thin-client-setup prepare
+thin-client-setup prepare
+brave-native
+code-native
 ```
 
 Status reports **New/unprepared workstation detected** when app executables are
 missing. Clicking a launcher never downloads anything. Preparation recreates
 missing cache targets behind existing correct links and restores applications
-and extensions; it preserves prepared profiles. If goinfre itself is unavailable,
+and extensions, including Brave runtime config/cache directories; it preserves
+prepared profiles. No repository clone is needed on each new post: the installed setup
+script is sufficient. If goinfre itself is unavailable,
 locate the school's account-owned storage first. Detection prefers `~/goinfre`
 when no explicit `GOINFRE` override is set; no username is hardcoded.
 
@@ -135,8 +140,10 @@ Destination: `~/.config/BraveSoftware/Brave-Browser`.
 Preserves bookmarks, history, login/cookie databases, Local State, preferences,
 extensions and their state, IndexedDB/local storage and sessions. Omits known
 caches only at explicitly approved relative paths, plus runtime locks and sockets.
-Service Worker registration databases, installed scripts and CacheStorage remain
-together in HOME. Anchored, directory-only rsync exclusions also preserve unknown
+Initial migration skips each supported profile’s entire `Service Worker` subtree,
+including old symlinks; the source stays untouched. Existing native Service Worker
+state is never managed or imported from goinfre. Anchored, directory-only cache
+exclusions also preserve unknown
 nested directories with cache-like names and unexpected files at cache locations.
 A checksum-based rsync dry run verifies the persistent
 copy before its staged directory is renamed into place.
@@ -222,8 +229,8 @@ Electron opens external URLs through the desktop's default applications;
 [VS Code's URI integration](https://code.visualstudio.com/api/advanced-topics/remote-extensions#callbacks-and-uri-handlers)
 supports native OAuth callbacks. Native Code drops an inherited `BROWSER`
 variable from its own environment because `xdg-open`'s generic fallback can use
-it. No browser executable is forced, and shell/Brave environments are unchanged.
-Managed setup queries and app launches use HOME's `.config` and `.local/share`
+it. No browser executable is forced, and the shell environment is unchanged.
+Desktop-handler queries and Code launches use HOME's `.config` and `.local/share`
 for XDG configuration and desktop entries.
 
 Run `thin-client-setup status` or `doctor` to see the actual default browser,
@@ -236,8 +243,18 @@ they do not perform live OAuth or prove keyring/network/provider behavior.
 
 ## Cache policy
 
-Brave uses `XDG_CACHE_HOME` in goinfre while its profile stays under HOME's
-`.config`. Known profile-local disposable caches also point into goinfre.
+Brave receives process-local runtime directories under validated goinfre:
+
+- `XDG_CONFIG_HOME=<thin-client-root>/runtime/brave/config`
+- `XDG_CACHE_HOME=<thin-client-root>/runtime/brave/cache`
+
+Both are created safely before launch and reconstructed by `prepare`. The real
+profile remains `~/.config/BraveSoftware/Brave-Browser`, selected explicitly with
+`--user-data-dir`; runtime configuration does not select another profile. This
+avoids inherited runtime configuration causing Crashpad startup failures. No
+global environment or shell configuration changes. Code and desktop-handler
+commands retain their own environment. Known profile-local disposable caches
+also point into goinfre.
 The HTTP disk-cache target is approximately **100 MiB**, not a hard limit on all
 browser storage. Persistent site databases, history and extensions can still grow.
 No GPU forcing or sandbox-disabling flags are added.
@@ -273,8 +290,9 @@ qualify. Cache setup does not inspect, redirect, relocate, or validate as caches
   and `Whatever/GPUCache`
 
 These remain persistent HOME data. Their presence never blocks cache setup.
-Migration and retirement backups use the same exact-path model for cache
-exclusions and preserve this site state. Full `migrate`, `integrate`, and `prepare`
+Migration and retirement backups use the same exact-path model for disposable
+cache exclusions. Initial migration additionally skips Service Worker state;
+explicit retirement backups preserve the source data. Full `migrate`, `integrate`, and `prepare`
 still prepare both apps.
 
 Existing prepared users need no additional profile migration for this cache fix:
@@ -292,56 +310,10 @@ An unapproved path is never offered to cache-link setup. A direct attempt to
 manage one is refused before cache validation. No `Dawn*` or `*Cache*` pattern
 grants relocation permission.
 
-Normal preparation does not rewrite old Service Worker symlinks or re-import an
-existing native profile. The explicit legacy repair below can restore recognized
-links whose data still exists. If an older import omitted site state, review the
-retained Flatpak source or backup; existing browser/site data is never overwritten
-automatically.
-
-### Repairing old Service Worker links
-
-Older versions could incorrectly redirect persistent `Service Worker/ScriptCache`
-and `Service Worker/CacheStorage` into goinfre. This state can exist on accounts
-prepared by those releases. `status` detects recognized links and recommends the
-explicit `repair-legacy` command; `prepare` never performs this repair implicitly.
-
-After updating the reviewed checkout, inspect without changing anything:
-
-```sh
-./thin-client-setup status
-./thin-client-setup repair-legacy --dry-run
-```
-
-For an existing installation, first update the installed script using the
-checkout's `./thin-client-setup install-self`. Then fully quit Brave, including
-background processes, and explicitly repair:
-
-```sh
-~/.local/bin/thin-client-setup repair-legacy
-```
-
-Only `Default` and `Profile <number>` links at the two exact Service Worker paths
-qualify. The link must point directly to the corresponding old project layout:
-`<validated goinfre>/thin-client/cache/brave-profile/<profile>/Service Worker/<name>`.
-An arbitrary external target, unrelated goinfre path, another profile's target,
-symlink ancestor, mount, or external indirection is refused. Normal directories,
-registration databases, other site storage and unknown symlink locations are
-never replaced.
-
-Repair copies the existing target into private HOME-side staging, checks file
-sizes/hashes and directory structure, checks that the source stayed unchanged,
-and checks Brave is still stopped before publishing the complete directory by
-a same-filesystem rename. The original link is retained temporarily for rollback
-if publication fails. The old goinfre directory is left intact. Repair logs paths
-only and is idempotent; successfully published staging directories are cleaned
-up. Verification/copy failures leave the link and source intact and retain staging
-for inspection. HOME needs space for the complete persistent copy.
-
-**Broken known links are refused, not replaced with invented empty state.** The
-old data is unavailable, and an empty ScriptCache cannot restore scripts referenced
-by registration metadata. Recover the exact target from a persistent backup before
-retrying, or manually review the lost site state. Diagnostics report missing
-targets; repair does not silently reset browser registrations or offline data.
+Service Worker storage is outside normal thin-client management. Missing paths
+remain absent; existing directories and symlinks remain untouched. Brave may
+recreate local site state naturally. No command restores old goinfre Service
+Worker data into HOME or recreates the old redirection design.
 
 Prior application releases and downloads are retained for rollback. Audit their
 space periodically; this tool does not silently prune them.

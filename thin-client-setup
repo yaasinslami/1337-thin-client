@@ -33,7 +33,7 @@ OLD_BRAVE = HOME / '.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browse
 OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
 STATE = HOME / '.local/share/thin-client'
 SELF = HOME / '.local/bin/thin-client-setup'
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS = (
     Path('Cache'), Path('Code Cache'), Path('GPUCache'),
     Path('DawnGraphiteCache'), Path('DawnWebGPUCache'),
@@ -44,9 +44,6 @@ BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS = (
 BRAVE_ROOT_DISPOSABLE_CACHE_PATHS = BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS + (
     Path('GraphiteDawnCache'), Path('GPUPersistentCache'),
 )
-# Persistent state: these paths are inspected only for explicit legacy repair.
-LEGACY_SERVICE_WORKER_PATHS = (Path('Service Worker/ScriptCache'),
-                               Path('Service Worker/CacheStorage'))
 CODE_CACHES = ['Cache', 'Code Cache', 'CachedData', 'CachedProfilesData',
                'CachedExtensionVSIXs', 'GPUCache', 'DawnGraphiteCache',
                'DawnWebGPUCache', 'logs', 'Crashpad']
@@ -415,122 +412,6 @@ def brave_caches(root):
         for relative in brave_disposable_relative_paths(BRAVE):
             brave_cache_link(BRAVE / relative, root / 'cache/brave-profile' / relative, root)
 
-def legacy_worker_symlinks():
-    """Look only at the two historical link locations in direct browser profiles."""
-    safe(BRAVE)
-    if BRAVE.is_dir():
-        for profile in sorted(BRAVE.iterdir()):
-            if (profile.name == 'Default' or re.fullmatch(r'Profile [0-9]+', profile.name)) and profile.is_dir():
-                safe(profile)
-                worker = profile / 'Service Worker'
-                safe(worker)
-                for relative in LEGACY_SERVICE_WORKER_PATHS:
-                    path = profile / relative
-                    if path.is_symlink():
-                        yield path
-
-def legacy_worker_target(path, root):
-    """Accept the exact former project target, never an arbitrary goinfre path."""
-    relative = path.relative_to(BRAVE)
-    parts = relative.parts
-    if (len(parts) != 3 or
-            not (parts[0] == 'Default' or re.fullmatch(r'Profile [0-9]+', parts[0])) or
-            Path(*parts[1:]) not in LEGACY_SERVICE_WORKER_PATHS or not path.is_symlink()):
-        raise RuntimeError(f'Not a known legacy Service Worker link (left intact): {path}')
-    if root.name != 'thin-client':
-        raise RuntimeError(f'Unexpected thin-client root: {root}')
-    validate_goinfre(root.parent, HOME)
-    safe(root)
-    safe(path.parent)
-    expected = safe(root / 'cache/brave-profile' / relative)
-    # The old project linked directly to this layout. Do not accept an external
-    # indirection just because it eventually resolves back into the cache tree.
-    lexical_target = Path(os.path.abspath(path.parent / os.readlink(path)))
-    if lexical_target != expected.absolute() or path.resolve() != expected.absolute():
-        raise RuntimeError(f'Unrecognized Service Worker symlink target (left intact): {path}')
-    return expected
-
-def legacy_worker_status(root):
-    found = False
-    try:
-        for path in legacy_worker_symlinks():
-            try:
-                target = legacy_worker_target(path, root)
-            except (OSError, RuntimeError):
-                print(f'Unrecognized Service Worker symlink: {path}; left intact; manual review required', flush=True)
-                continue
-            found = True
-            print(f'Legacy Service Worker symlink detected: {path}; '
-                  f'target {"present" if target.is_dir() else "missing or invalid"}', flush=True)
-    except (OSError, RuntimeError) as error:
-        print(f'Legacy Service Worker inspection refused: {error}', flush=True)
-    if found:
-        print('Run: ~/.local/bin/thin-client-setup repair-legacy (with Brave fully stopped). '
-              'Missing targets require recovery from a persistent backup.', flush=True)
-
-def legacy_tree_manifest(directory):
-    """Verify plain files/directories without following links or mounted trees."""
-    safe(directory)
-    if not directory.is_dir() or directory.is_mount():
-        raise RuntimeError(f'Invalid legacy site-state directory: {directory}')
-    manifest = {}
-    def walk_error(error):
-        raise RuntimeError(f'Cannot inspect legacy site-state copy: {error.filename}') from error
-    for parent, dirs, files in os.walk(directory, followlinks=False, onerror=walk_error):
-        for name in dirs + files:
-            path = Path(parent) / name
-            mode = path.lstat().st_mode
-            if path.is_symlink() or path.is_mount() or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
-                raise RuntimeError(f'Unexpected link, mount, or special file in legacy site state: {path}')
-            manifest[path.relative_to(directory).as_posix()] = (
-                ('directory',) if stat.S_ISDIR(mode) else ('file', path.stat().st_size, digest(path)))
-    return manifest
-
-def repair_legacy(root):
-    # Preflight every candidate before modifying any profile path.
-    candidates = [(path, legacy_worker_target(path, root)) for path in legacy_worker_symlinks()]
-    if not candidates:
-        print('No recognized legacy Service Worker links need repair.', flush=True)
-        return
-    stopped(('brave',))
-    for path, target in candidates:
-        if not target.is_dir() or target.is_mount():
-            raise RuntimeError(f'Legacy site-state target missing or invalid (link left intact): {path}; '
-                               'restore the exact target from a persistent backup or review the lost site state. '
-                               'An empty directory cannot reconstruct installed scripts or offline data.')
-        for parent in [target, *target.parents]:
-            if parent == root or root in parent.parents:
-                if parent.is_mount():
-                    raise RuntimeError(f'Mount in legacy site-state target (left intact): {parent}')
-    for path, target in candidates:
-        original_link = os.readlink(path)
-        original_inode = path.lstat().st_ino
-        original = legacy_tree_manifest(target)
-        stage = Path(tempfile.mkdtemp(prefix='.thin-client-legacy-', dir=safe(path.parent)))
-        payload = stage / 'restored'
-        print(f'Legacy repair staging: {path} -> {payload}; original goinfre data retained', flush=True)
-        shutil.copytree(target, payload, symlinks=True)
-        if legacy_tree_manifest(payload) != original or legacy_tree_manifest(target) != original:
-            raise RuntimeError(f'Legacy copy verification failed; link/source unchanged; staging retained: {stage}')
-        stopped(('brave',))
-        legacy_worker_target(path, root)
-        if path.lstat().st_ino != original_inode or os.readlink(path) != original_link:
-            raise RuntimeError(f'Legacy link changed during repair (left intact): {path}; staging retained: {stage}')
-        saved_link = stage / 'original-link'
-        # A directory cannot replace a symlink directly with rename. Save the
-        # verified link, publish the complete HOME-side directory, and roll back
-        # the link if publication fails. Never delete the original goinfre tree.
-        path.rename(saved_link)
-        try:
-            os.replace(payload, path)
-        except OSError:
-            if not path.exists() and not path.is_symlink():
-                saved_link.rename(path)
-            raise
-        saved_link.unlink()
-        stage.rmdir()
-        print(f'Repaired legacy Service Worker link into persistent HOME directory: {path}', flush=True)
-
 def migrate(root):
     stopped()
     safe(BRAVE); safe(CODE)
@@ -556,6 +437,11 @@ def migrate_brave(stage):
     if not (OLD_BRAVE / 'Local State').is_file():
         raise RuntimeError('Flatpak Brave source exists but lacks Local State')
     excludes = brave_copy_excludes(OLD_BRAVE)
+    # Never import Service Worker state, including old goinfre-backed links.
+    # Anchor the whole subtree to each supported profile; leave sources intact.
+    profiles = {relative.parts[0] for relative in brave_disposable_relative_paths(OLD_BRAVE)
+                if len(relative.parts) == 2}
+    excludes += [f'--exclude=/{profile}/Service Worker' for profile in sorted(profiles)]
     excludes += ['--exclude=Singleton*', '--exclude=*.lock', '--exclude=*.sock',
                  '--exclude=.org.chromium.*', '--exclude=.thin-client-import']
     dry = run(['rsync', '-an', '--stats', *excludes, str(OLD_BRAVE) + '/', str(stage) + '/'],
@@ -619,7 +505,13 @@ def environment(root, app):
     env['XDG_DATA_HOME'] = str(HOME / '.local/share')
     env['XDG_CACHE_HOME'] = str(root / 'cache' / app)
     env['TMPDIR'] = str(root / 'tmp')
-    paths = [root / 'cache' / app, root / 'tmp']
+    if app == 'brave':
+        # Process-local runtime configuration; the real profile is explicit in argv.
+        env['XDG_CONFIG_HOME'] = str(root / 'runtime/brave/config')
+        env['XDG_CACHE_HOME'] = str(root / 'runtime/brave/cache')
+    paths = [Path(env['XDG_CACHE_HOME']), root / 'tmp']
+    if app == 'brave':
+        paths.append(Path(env['XDG_CONFIG_HOME']))
     if app == 'vscode':
         # xdg-open's generic fallback can honor BROWSER. Use desktop handlers
         # for native Code, without forcing a browser or changing the shell.
@@ -639,6 +531,7 @@ def integrate(root):
     stopped()
     vscode_caches(root)
     brave_caches(root)
+    environment(root, 'brave')  # Reconstruct workstation-local runtime on prepare.
     env = environment(root, 'vscode')
     for ext in EXTENSIONS:
         run([*code_args(root), '--install-extension', ext], env=env)
@@ -928,7 +821,7 @@ def cli_parser():
     parser = argparse.ArgumentParser(description='Native Brave + VS Code thin client; no HOME binary fallback')
     parser.add_argument('--version', action='version', version=f'thin-client-setup {VERSION}')
     subs = parser.add_subparsers(dest='command', required=True)
-    for command in ['audit', 'doctor', 'status', 'install-self', 'repair-legacy', 'install', 'migrate', 'integrate', 'desktop', 'prepare', 'browser-default']:
+    for command in ['audit', 'doctor', 'status', 'install-self', 'install', 'migrate', 'integrate', 'desktop', 'prepare', 'browser-default']:
         sub = subs.add_parser(command)
         sub.add_argument('--dry-run', action='store_true')
         if command in ['integrate', 'prepare']:
@@ -975,7 +868,6 @@ def main(argv=None):
     root = goinfre()
     print(f'Goinfre: {root}\nBrave persistent profile: {BRAVE}\nVS Code persistent state: {CODE}', flush=True)
     if command == 'status':
-        legacy_worker_status(root)
         for p in [root / 'apps/brave/current', root / 'apps/vscode/current', BRAVE, CODE, root / 'vscode-extensions']:
             print(p, 'present' if p.exists() else 'missing')
         if not all(os.access(root / exe, os.X_OK) for exe in
@@ -987,10 +879,7 @@ def main(argv=None):
         codex_status(root)
         return
     if getattr(options, 'dry_run', False):
-        if command == 'repair-legacy':
-            legacy_worker_status(root)
-            print('DRY RUN: repair-legacy; no links, files or directories changed')
-        elif command == 'retire-flatpak':
+        if command == 'retire-flatpak':
             retire_flatpak(root, options.app, dry_run=True, backup=not options.no_backup)
         else:
             print(f'DRY RUN: {command}; no files, locks, downloads or handlers changed')
@@ -1003,8 +892,6 @@ def main(argv=None):
     with (STATE / 'setup.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         safe(root).mkdir(parents=True, exist_ok=True)
-        if command == 'repair-legacy':
-            repair_legacy(root)
         if command in ['install', 'integrate', 'desktop', 'prepare', 'defaults']:
             install_self()
         if command in ['install', 'prepare']:

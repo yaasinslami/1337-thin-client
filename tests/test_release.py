@@ -300,7 +300,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse((self.root / 'cache-backups').exists())
 
     @unittest.skipUnless(shutil.which('rsync'), 'rsync is required for profile copy integration')
-    def test_real_brave_migration_preserves_site_state_and_nested_cache_names(self):
+    def test_real_brave_migration_skips_workers_preserves_other_site_state(self):
         tool.OLD_BRAVE.mkdir(parents=True)
         (tool.OLD_BRAVE / 'Local State').write_text('{}')
         persistent = self.browser_site_state_fixture(tool.OLD_BRAVE)
@@ -310,7 +310,10 @@ class ReleaseTests(unittest.TestCase):
              mock.patch.object(tool.shutil, 'disk_usage', return_value=mock.Mock(free=10 * 1024**3)):
             tool.migrate_brave(tool.BRAVE.with_name('Brave-Browser.thin-client-partial'))
         for relative, contents in persistent.items():
-            self.assertEqual((tool.BRAVE / relative).read_bytes(), contents)
+            if '/Service Worker/' in relative:
+                self.assertFalse((tool.BRAVE / relative).exists())
+            else:
+                self.assertEqual((tool.BRAVE / relative).read_bytes(), contents)
             self.assertEqual((tool.OLD_BRAVE / relative).read_bytes(), contents)
         self.assertEqual((tool.BRAVE / 'Cache').read_bytes(), b'keep unexpected file')
         for name in ['DawnWebGPUCache', 'GPUCache']:

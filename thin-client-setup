@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # Managed by thin-client-setup
-"""Explicit, non-destructive native Brave/VS Code setup for this thin client.
+"""Explicit native apps and developer tools for this Linux thin client.
 
-Commands: install (download/update), migrate (copy once), integrate (launchers),
-prepare (all three), status, open brave|code [arguments]. Launchers NEVER download.
-No sudo, process killing, old-profile removal, shell/SSH edits or home fallback.
+Commands: install (download/update), migrate (copy once), integrate (launchers/theme),
+prepare (all steps), theme, status, open brave|code|spotify|codex|claude [arguments].
+Launchers NEVER download.
+No sudo, process killing, old-profile removal, SSH edits or large HOME fallback.
 Official-download ideas adapted from shank187/session-setup (MIT); see
 README.md and THIRD_PARTY_NOTICES.md for attribution and storage details.
 """
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import select
 import shlex
 import shutil
 import stat
@@ -29,26 +32,180 @@ import zipfile
 HOME = Path.home()
 BRAVE = HOME / '.config/BraveSoftware/Brave-Browser'
 CODE = HOME / '.config/Code-Thin'
+SPOTIFY = HOME / '.config/Spotify-Thin'
 OLD_BRAVE = HOME / '.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser'
 OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
 STATE = HOME / '.local/share/thin-client'
 SELF = HOME / '.local/bin/thin-client-setup'
-VERSION = '0.2.0'
+VERSION = '0.11.5'
+# The Snap Store identity is stable across Spotify releases.  Downloaded
+# revisions are accepted only when the signed assertion names this exact snap.
+SPOTIFY_SNAP_ID = 'pOBIoZ2LrCB3rDohMxoYGnbN14EHOgD7'
+SPOTIFY_ICON_SHA256 = 'da58c89167809f2516846caf6de161d72c30074d07ce9437b0af743ed6292abd'
+# Spotify's current stable Snap is based on Ubuntu 24.04 and requires newer
+# glibc than the school Ubuntu 22.04 posts provide. Keep the complete signed
+# runtime stack beside Spotify instead of depending on root-owned /snap state.
+SPOTIFY_BASE = 'core24'
+SPOTIFY_RUNTIME_SNAP_IDS = {
+    'core24': 'dwTAh7MZZ01zyriOZErqd1JynQLiOGvM',
+    'gnome-46-2404': 'ew7OxpbRTxfK7ImpIygRR85lkxvU7Pzt',
+    'mesa-2404': 'HyhSEBPv3vHsW6uOHkQR384NgI7S6zpj',
+    'gtk-common-themes': 'jZLfBRzf1cYlYysIjD2bwSzNtngY0qit',
+}
+BWRAP = Path('/usr/bin/bwrap')
 BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS = (
     Path('Cache'), Path('Code Cache'), Path('GPUCache'),
     Path('DawnGraphiteCache'), Path('DawnWebGPUCache'),
     Path('GrShaderCache'), Path('ShaderCache'),
+    Path('BrowserMetrics'), Path('Crash Reports'), Path('Crashpad'),
+    Path('component_crx_cache'), Path('extensions_crx_cache'),
 )
 # Root locations are separate from profile locations. These two additional
 # rendering caches are defined by Chromium's browser content client.
 BRAVE_ROOT_DISPOSABLE_CACHE_PATHS = BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS + (
     Path('GraphiteDawnCache'), Path('GPUPersistentCache'),
 )
+# Older reviewed releases also created these two Chromium root-cache names
+# inside profile directories.  Switch only existing legacy links; never create
+# or relocate real directories at those obsolete locations.
+BRAVE_LEGACY_PROFILE_CACHE_LINKS = (
+    Path('GraphiteDawnCache'), Path('GPUPersistentCache'),
+)
 CODE_CACHES = ['Cache', 'Code Cache', 'CachedData', 'CachedProfilesData',
                'CachedExtensionVSIXs', 'GPUCache', 'DawnGraphiteCache',
                'DawnWebGPUCache', 'logs', 'Crashpad']
-EXTENSIONS = ['ms-vscode-remote.remote-ssh', 'ms-vscode-remote.remote-ssh-edit']
+EXTENSIONS = ['ms-vscode-remote.remote-ssh', 'ms-vscode-remote.remote-ssh-edit',
+              'subframe7536.custom-ui-style', 'l-igh-t.vscode-theme-seti-folder']
+# This post-0.0.2 Islands Dark revision includes the fixed activity-bar width
+# and improved panel/terminal geometry, although upstream's package.json still
+# reports 0.0.2. Fetch an immutable revision rather than executing its scripts.
+ISLANDS_DARK_COMMIT = '6a1621a980053af19161594bf82322af7c911578'
+ISLANDS_DARK_VERSION = '0.0.2'
+ISLANDS_DARK_MANAGED_COMMITS = (
+    '87612342689951937eb6664e733132cfcf56633d',
+    ISLANDS_DARK_COMMIT,
+)
+ISLANDS_DARK_COMFORT_SETTINGS = {
+    # Noto Sans Mono is present on the managed school Linux image and, unlike
+    # the missing upstream font names, never falls back to proportional text.
+    'editor.fontFamily': "'Noto Sans Mono', 'DejaVu Sans Mono', monospace",
+    'editor.fontSize': 14,
+    'editor.fontWeight': '450',
+    'editor.lineHeight': 24,
+    'editor.letterSpacing': 0.15,
+    'editor.fontLigatures': False,
+    'terminal.integrated.fontFamily': "'Noto Sans Mono', 'DejaVu Sans Mono', monospace",
+    'terminal.integrated.fontSize': 14,
+    'terminal.integrated.fontWeight': '500',
+    'terminal.integrated.fontWeightBold': '700',
+    'terminal.integrated.lineHeight': 1.3,
+    'terminal.integrated.letterSpacing': 0,
+    'terminal.integrated.minimumContrastRatio': 4.5,
+    'terminal.integrated.drawBoldTextInBrightColors': True,
+    # Remote work must remain responsive on school posts without a usable DRM
+    # render node. Motion effects are particularly expensive under Chromium's
+    # software renderer and do not improve editing functionality.
+    'editor.cursorBlinking': 'blink',
+    'editor.cursorSmoothCaretAnimation': 'off',
+    'editor.smoothScrolling': False,
+    'workbench.list.smoothScrolling': False,
+    'terminal.integrated.smoothScrolling': False,
+    # Echo terminal keystrokes locally and at full foreground intensity. This
+    # hides the unavoidable round trip when Tailscale must use a DERP relay.
+    'terminal.integrated.localEchoEnabled': 'on',
+    'terminal.integrated.localEchoLatencyThreshold': 0,
+    'terminal.integrated.localEchoStyle': '#EEEEEC',
+    'editor.bracketPairColorization.enabled': True,
+    'editor.guides.bracketPairs': 'active',
+    'editor.guides.highlightActiveIndentation': True,
+    'editor.minimap.scale': 1,
+    'editor.minimap.maxColumn': 100,
+    'editor.minimap.showSlider': 'mouseover',
+    'editor.minimap.renderCharacters': False,
+    # Generated dependency trees otherwise produce large remote watcher event
+    # bursts in pnpm/npm monorepos. They remain visible and searchable when
+    # explicitly requested; only continuous file watching is disabled.
+    'files.watcherExclude': {
+        '**/.git/objects/**': True,
+        '**/.git/subtree-cache/**': True,
+        '**/node_modules/**': True,
+        '**/.pnpm-store/**': True,
+        '**/.next/**': True,
+        '**/dist/**': True,
+        '**/build/**': True,
+        '**/coverage/**': True,
+    },
+    'workbench.tree.indent': 18,
+    'workbench.iconTheme': 'vs-seti-folder',
+    'workbench.colorTheme': 'Islands Dark',
+    # Remote-SSH 0.128's managed exec-server path can pause for tens of
+    # seconds on a userspace Tailscale ProxyCommand. The classic server path
+    # keeps the already-working SSH tunnel and avoids that extra managed hop.
+    'remote.SSH.useLocalServer': True,
+    'remote.SSH.useExecServer': False,
+    # A slow/relayed first connection should not be discarded after the
+    # extension's 15-second default. This affects connection setup only.
+    'remote.SSH.connectTimeout': 30,
+}
+ISLANDS_DARK_LOW_LATENCY_STYLES = {
+    # Keep the Islands geometry and colors, but prevent animation and smooth
+    # scrolling from forcing continuous software-rendered repaints.
+    '.monaco-workbench *': {
+        'transition-duration': '0s !important',
+        'animation-duration': '0s !important',
+        'scroll-behavior': 'auto !important',
+    },
+}
+ISLANDS_DARK_COMFORT_COLORS = {
+    'editor.background': '#15171A',
+    'editor.foreground': '#C7CAD1',
+    'editorGutter.background': '#15171A',
+    'editor.lineHighlightBackground': '#1C1F24',
+    'editor.selectionBackground': '#33445C',
+    'editor.inactiveSelectionBackground': '#293748',
+    'editor.selectionHighlightBackground': '#33445C70',
+    'editorCursor.foreground': '#82AAFF',
+    'editorLineNumber.foreground': '#50545C',
+    'editorLineNumber.activeForeground': '#A7ABB5',
+    'editorIndentGuide.background1': '#252A31',
+    'editorIndentGuide.activeBackground1': '#4B5665',
+    'editorWhitespace.foreground': '#343941',
+    'editorBracketMatch.background': '#2B3442',
+    'editorBracketMatch.border': '#65758B',
+    'minimap.background': '#15171A',
+    'scrollbarSlider.background': '#5C637040',
+    'scrollbarSlider.hoverBackground': '#6B738055',
+    'scrollbarSlider.activeBackground': '#7A839266',
+    'statusBar.foreground': '#6F747E',
+    'statusBar.noFolderForeground': '#6F747E',
+    'terminal.background': '#181A1D',
+    'terminal.foreground': '#EEEEEC',
+    'terminalCursor.foreground': '#FFFFFF',
+    'terminalCursor.background': '#181A1D',
+    'terminal.selectionBackground': '#4A607A',
+    # Saturated Tango-style ANSI slots match the colors requested by the
+    # account's Oh My Zsh robbyrussell prompt without translucent pastels.
+    'terminal.ansiBlack': '#2E3436',
+    'terminal.ansiBrightBlack': '#888A85',
+    'terminal.ansiRed': '#EF2929',
+    'terminal.ansiBrightRed': '#FF5C57',
+    'terminal.ansiGreen': '#8AE234',
+    'terminal.ansiBrightGreen': '#B6F077',
+    'terminal.ansiYellow': '#FCE94F',
+    'terminal.ansiBrightYellow': '#FFFFA5',
+    'terminal.ansiBlue': '#729FCF',
+    'terminal.ansiBrightBlue': '#9DC7F1',
+    'terminal.ansiMagenta': '#AD7FA8',
+    'terminal.ansiBrightMagenta': '#D9A9D4',
+    'terminal.ansiCyan': '#34E2E2',
+    'terminal.ansiBrightCyan': '#74F3F3',
+    'terminal.ansiWhite': '#EEEEEC',
+    'terminal.ansiBrightWhite': '#FFFFFF',
+}
 APP_IDS = {'brave': 'com.brave.Browser', 'vscode': 'com.visualstudio.code'}
+CLAUDE_SIGNING_FINGERPRINT = '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE'
+PYENV_VERSION = '2.8.1'
+PYENV_COMMIT = 'bec9a562a59e48a730fe3320fe90c6999c82886c'
 
 def parse_jsonc(text):
     """Remove JSON comments/trailing commas without changing string contents."""
@@ -118,7 +275,7 @@ def safe(path):
         raise RuntimeError(f'Unexpected symlink in path: {path}')
     return path
 
-def goinfre():
+def goinfre(require_writable=True):
     # Prefer the real account-owned home/goinfre link over a guessed login name.
     candidate = os.environ.get('GOINFRE')
     if candidate:
@@ -127,14 +284,14 @@ def goinfre():
         root = (HOME / 'goinfre').resolve()
     else:
         root = Path('/goinfre') / HOME.name
-    validate_goinfre(root, HOME)
+    validate_goinfre(root, HOME, require_writable=require_writable)
     return safe(root / 'thin-client')
 
-def validate_goinfre(root, home):
+def validate_goinfre(root, home, require_writable=True):
     root, home = Path(root).resolve(), Path(home).resolve()
     if not root.is_dir() or root.stat().st_uid != os.getuid():
         raise RuntimeError(f'No existing account-owned goinfre: {root}')
-    if not os.access(root, os.W_OK | os.X_OK):
+    if require_writable and not os.access(root, os.W_OK | os.X_OK):
         raise RuntimeError(f'Goinfre is not writable: {root}')
     if root == home or home in root.parents or root in home.parents:
         raise RuntimeError('Goinfre must be outside HOME, not an ancestor of HOME')
@@ -142,11 +299,34 @@ def validate_goinfre(root, home):
         raise RuntimeError('Goinfre must be on a separate filesystem from HOME')
     return root
 
-def stopped(apps=('brave', 'vscode')):
+def transient_runtime_path():
+    """Stable private scratch path used when a school post mounts goinfre read-only."""
+    return Path('/tmp') / f'thin-client-runtime-{os.getuid()}'
+
+def vscode_extensions():
+    """Small portable Code extensions persist with the account across posts."""
+    return safe(STATE / 'vscode-extensions')
+
+def runtime_storage(root):
+    """Use goinfre when writable; otherwise use private, disposable local storage."""
+    root = Path(root)
+    if root.is_dir() and os.access(root, os.W_OK | os.X_OK):
+        return root
+    runtime = safe(transient_runtime_path())
+    if runtime.exists():
+        if (not runtime.is_dir() or runtime.is_symlink() or
+                runtime.stat().st_uid != os.getuid()):
+            raise RuntimeError(f'Unsafe transient runtime directory: {runtime}')
+    else:
+        runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    return runtime
+
+def stopped(apps=('brave', 'vscode', 'spotify')):
     # /proc can be namespace-filtered in Codex; flatpak ps is also mandatory.
     if shutil.which('flatpak'):
         r = run(['flatpak', 'ps', '--columns=application'], capture_output=True, text=True)
-        ids = [APP_IDS[a] for a in apps]
+        ids = [APP_IDS[a] for a in apps if a in APP_IDS]
         if any(x in r.stdout.splitlines() for x in ids):
             raise RuntimeError('Quit the relevant Flatpak applications before proceeding')
     names = set()
@@ -154,6 +334,8 @@ def stopped(apps=('brave', 'vscode')):
         names.update(['brave', 'brave-browser'])
     if 'vscode' in apps:
         names.update(['code', 'code-insiders'])
+    if 'spotify' in apps:
+        names.add('spotify')
     r = run(['ps', '-eo', 'uid=,pid=,comm='], capture_output=True, text=True)
     for line in r.stdout.splitlines():
         fields = line.split()
@@ -164,7 +346,8 @@ def url_checked(url):
     p = urllib.parse.urlparse(url)
     host = p.hostname or ''
     allowed = ['versions.brave.com', 'github.com', 'update.code.visualstudio.com',
-               'vscode.download.prss.microsoft.com', 'az764295.vo.msecnd.net']
+               'vscode.download.prss.microsoft.com', 'az764295.vo.msecnd.net',
+               'chatgpt.com', 'downloads.claude.ai']
     if p.scheme != 'https' or p.username or p.password or host not in allowed:
         raise RuntimeError(f'Unexpected official download URL host: {host}')
     return url
@@ -299,6 +482,527 @@ def install_app(root, app, version, url, sha, kind, work):
     # Prior releases/downloads are intentionally retained, never auto-cleaned.
     print(f'Activated: {appdir / "current"} -> {dest}', flush=True)
 
+def snap_assertion(path, expected_id, label):
+    """Read and pin one store-issued snap-revision assertion."""
+    text = path.read_text()
+    sections = re.split(r'(?=^type: )', text, flags=re.MULTILINE)
+    for section in sections:
+        header = section.split('\n\n', 1)[0]
+        fields = dict(re.findall(r'^([a-z0-9-]+): (.+)$', header, re.MULTILINE))
+        if fields.get('type') != 'snap-revision':
+            continue
+        required = ('snap-id', 'snap-revision', 'snap-size', 'snap-sha3-384')
+        if any(not fields.get(name) for name in required):
+            raise RuntimeError(f'Incomplete {label} Snap Store assertion')
+        if fields['snap-id'] != expected_id:
+            raise RuntimeError(f'Downloaded snap does not have {label}\'s pinned Store identity')
+        if not fields['snap-revision'].isdigit() or not fields['snap-size'].isdigit():
+            raise RuntimeError(f'Invalid {label} Snap Store revision metadata')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{64}', fields['snap-sha3-384']):
+            raise RuntimeError(f'Invalid {label} Snap Store SHA3-384')
+        return fields
+    raise RuntimeError(f'{label} snap-revision assertion is missing')
+
+def spotify_assertion(path):
+    return snap_assertion(path, SPOTIFY_SNAP_ID, 'Spotify')
+
+def sha3_384_file(path):
+    value = hashlib.sha3_384()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            value.update(block)
+    return base64.urlsafe_b64encode(value.digest()).decode().rstrip('=')
+
+def yaml_scalar(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value
+
+def spotify_snap_metadata(path):
+    """Read only the small, required subset of the trusted snap.yaml file."""
+    text = path.read_text()
+    def top(name):
+        match = re.search(rf'^{re.escape(name)}:\s*([^#\n]+)', text, re.MULTILINE)
+        if not match:
+            raise RuntimeError(f'Spotify snap metadata lacks {name}')
+        return yaml_scalar(match.group(1))
+    name, version, base = top('name'), top('version'), top('base')
+    if name != 'spotify' or not re.fullmatch(r'[0-9A-Za-z.+_-]+', version):
+        raise RuntimeError('Unexpected Spotify snap name/version')
+    if base != SPOTIFY_BASE:
+        raise RuntimeError(f'Unsupported Spotify snap base: {base}')
+    lines = text.splitlines()
+    app_start = next((index for index, line in enumerate(lines)
+                      if re.fullmatch(r'  spotify:\s*', line)), None)
+    if app_start is None:
+        raise RuntimeError('Spotify snap app declaration is missing')
+    block = []
+    for line in lines[app_start + 1:]:
+        if line and not line.startswith('    '):
+            break
+        block.append(line)
+    command = next((yaml_scalar(line.split(':', 1)[1]) for line in block
+                    if re.match(r'^    command:\s*\S', line)), None)
+    if not command:
+        raise RuntimeError('Spotify snap command is missing')
+    command_tokens = shlex.split(command)
+    if not command_tokens or '/' not in command_tokens[0]:
+        raise RuntimeError('Unexpected Spotify snap command')
+    chains = []
+    in_chain = False
+    for line in block:
+        if re.match(r'^    command-chain:\s*$', line):
+            in_chain = True
+            continue
+        # YAML permits a block sequence to be indented either beneath its key
+        # or at the key's own indentation level.  snapcraft emits the latter:
+        #     command-chain:
+        #     - snap/command-chain/desktop-launch
+        if in_chain and re.match(r'^ {4,6}-\s*\S', line):
+            chains.append(yaml_scalar(re.sub(r'^ {4,6}-\s*', '', line, count=1)))
+        elif in_chain and line.strip() and not re.match(r'^ {6,}', line):
+            in_chain = False
+    if any('/' not in item or any(char.isspace() for char in item) for item in chains):
+        raise RuntimeError('Unexpected Spotify snap command chain')
+    return {'version': version, 'base': base, 'command': command_tokens,
+            'command_chain': chains}
+
+def snap_path(release, value):
+    value = value.replace('${SNAP}', str(release)).replace('$SNAP', str(release))
+    candidate = Path(value) if value.startswith('/') else release / value
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(release.resolve()):
+        raise RuntimeError(f'Spotify snap command escapes its release: {value}')
+    return resolved
+
+def spotify_launch(root, release=None, metadata=None):
+    release = release or spotify_release(root)[0]
+    if metadata is None:
+        metadata = spotify_release(root)[1]
+    paths = [snap_path(release, value) for value in metadata['command_chain']]
+    paths.append(snap_path(release, metadata['command'][0]))
+    for executable in paths:
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise RuntimeError(f'Spotify executable is missing: {executable}')
+    argv = [*paths, *metadata['command'][1:]]
+    return paths[0], argv
+
+def snap_runtime_release(root, name):
+    """Validate and return one active managed runtime extracted from the Store."""
+    if name not in SPOTIFY_RUNTIME_SNAP_IDS:
+        raise RuntimeError(f'Unknown Spotify runtime: {name}')
+    appdir = root / 'apps/snap-runtimes' / name
+    current = appdir / 'current'
+    if not current.is_symlink():
+        raise RuntimeError(f'Spotify runtime {name} is missing: run '
+                           'thin-client-setup spotify prepare')
+    release = current.resolve()
+    if not release.is_relative_to((appdir / 'releases').resolve()):
+        raise RuntimeError(f'Spotify runtime link escapes managed storage: {current}')
+    receipt = release / '.thin-client-install.json'
+    if not receipt.is_file() or receipt.is_symlink():
+        raise RuntimeError(f'Spotify runtime receipt is missing: {name}')
+    metadata = json.loads(receipt.read_text())
+    if (metadata.get('backend') != 'official-snap-runtime' or
+            metadata.get('name') != name or
+            metadata.get('snap_id') != SPOTIFY_RUNTIME_SNAP_IDS[name]):
+        raise RuntimeError(f'Unexpected Spotify runtime receipt: {receipt}')
+    return release, metadata
+
+def ensure_spotify_mountpoints(release):
+    """Create empty targets used only for nested read-only runtime mounts."""
+    for relative in ('gnome-platform', 'gpu-2404', 'data-dir/themes',
+                     'data-dir/icons', 'data-dir/sounds'):
+        target = release / relative
+        if target.exists() and not target.is_dir():
+            raise RuntimeError(f'Unexpected Spotify runtime mount target: {target}')
+        target.mkdir(parents=True, exist_ok=True)
+
+def spotify_layout_mounts(core, gnome, mesa):
+    """Recreate the filesystem layouts snapd applies to the Spotify snap."""
+    layouts = (
+        (gnome / 'usr/lib/x86_64-linux-gnu/webkit2gtk-4.0',
+         core / 'usr/lib/x86_64-linux-gnu/webkit2gtk-4.0', 'dir', True),
+        (gnome / 'usr/lib/x86_64-linux-gnu/webkit2gtk-4.1',
+         core / 'usr/lib/x86_64-linux-gnu/webkit2gtk-4.1', 'dir', False),
+        (gnome / 'usr/share/xml/iso-codes',
+         core / 'usr/share/xml/iso-codes', 'dir', False),
+        (mesa / 'libdrm', core / 'usr/share/libdrm', 'dir', False),
+        (mesa / 'drirc.d', core / 'usr/share/drirc.d', 'dir', False),
+        (mesa / 'X11/XErrorDB', core / 'usr/share/X11/XErrorDB', 'file', False),
+    )
+    mounts = []
+    for source, target, kind, optional in layouts:
+        if not source.exists():
+            if optional:
+                continue
+            raise RuntimeError(f'Spotify runtime layout source is missing: {source}')
+        resolved_source = source.resolve()
+        provider = gnome if source.is_relative_to(gnome) else mesa
+        if not resolved_source.is_relative_to(provider.resolve()):
+            raise RuntimeError(f'Spotify runtime layout escapes its provider: {source}')
+        source_ok = resolved_source.is_dir() if kind == 'dir' else resolved_source.is_file()
+        if not source_ok:
+            raise RuntimeError(f'Unexpected Spotify runtime layout source: {source}')
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                raise RuntimeError(f'Unexpected Spotify runtime layout target: {target}')
+            if kind == 'dir':
+                if target.exists() and not target.is_dir():
+                    raise RuntimeError(f'Unexpected Spotify runtime layout target: {target}')
+                target.mkdir(exist_ok=True)
+            else:
+                if target.exists() and not target.is_file():
+                    raise RuntimeError(f'Unexpected Spotify runtime layout target: {target}')
+                target.touch(exist_ok=True)
+        except OSError as error:
+            raise RuntimeError('Spotify layouts are not initialized and goinfre is read-only; '
+                               'run `thin-client-setup spotify prepare` once from a writable post') from error
+        if not target.resolve().is_relative_to(core.resolve()):
+            raise RuntimeError(f'Spotify runtime layout target escapes core24: {target}')
+        mounts.append((resolved_source, target))
+    return mounts
+
+def spotify_release(root):
+    """Return and validate the active official Spotify Snap extraction."""
+    current = root / 'apps/spotify/current'
+    if not current.is_symlink():
+        raise RuntimeError('Spotify app missing: run thin-client-setup spotify prepare')
+    release = current.resolve()
+    if not release.is_relative_to((root / 'apps/spotify/releases').resolve()):
+        raise RuntimeError(f'Spotify release link escapes managed storage: {current}')
+    receipt = release / '.thin-client-install.json'
+    if not receipt.is_file() or receipt.is_symlink():
+        raise RuntimeError('Spotify app receipt is missing')
+    receipt_metadata = json.loads(receipt.read_text())
+    if (receipt_metadata.get('backend') != 'official-spotify-snap' or
+            receipt_metadata.get('snap_id') != SPOTIFY_SNAP_ID or
+            receipt_metadata.get('base') != SPOTIFY_BASE or
+            not isinstance(receipt_metadata.get('command'), list) or
+            not isinstance(receipt_metadata.get('command_chain'), list)):
+        raise RuntimeError(f'Unexpected Spotify app receipt: {receipt}')
+    # The signed/extracted snap.yaml is the runtime authority.  Older script
+    # versions misread Snapcraft's legal indentation-less command-chain list
+    # and wrote an empty chain to otherwise valid receipts.  Repair that in
+    # memory so existing installations work immediately, without downloading.
+    parsed = spotify_snap_metadata(release / 'meta/snap.yaml')
+    if (parsed['version'] != receipt_metadata.get('version') or
+            parsed['base'] != receipt_metadata.get('base')):
+        raise RuntimeError(f'Spotify snap metadata differs from its receipt: {release}')
+    metadata = dict(receipt_metadata)
+    metadata['command'] = parsed['command']
+    metadata['command_chain'] = parsed['command_chain']
+    spotify_launch(root, release, metadata)
+    ensure_spotify_mountpoints(release)
+    return release, metadata
+
+def validate_snap_tree(directory, allow_external_links=False):
+    """Reject special files and escaping links after unsquashfs extraction."""
+    root = directory.resolve()
+    for path in directory.rglob('*'):
+        details = path.lstat()
+        if path.is_symlink():
+            if not allow_external_links and not path.resolve().is_relative_to(root):
+                raise RuntimeError(f'Escaping link in Spotify snap: {path}')
+        elif path.is_file() or path.is_dir():
+            if details.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                path.chmod(stat.S_IMODE(details.st_mode) & 0o777)
+        else:
+            raise RuntimeError(f'Unexpected special file in Spotify snap: {path}')
+
+def install_snap_runtime(root, name, work):
+    """Download, verify and activate a signed Snap runtime in goinfre."""
+    expected_id = SPOTIFY_RUNTIME_SNAP_IDS[name]
+    runtime_work = work / name
+    runtime_work.mkdir(mode=0o700, exist_ok=True)
+    snap = runtime_work / f'{name}.snap'
+    assertion = runtime_work / f'{name}.assert'
+    if not snap.is_file() or not assertion.is_file():
+        run(['snap', 'download', name, '--stable', f'--basename={name}',
+             f'--target-directory={runtime_work}'])
+    fields = snap_assertion(assertion, expected_id, name)
+    if snap.stat().st_size != int(fields['snap-size']):
+        raise RuntimeError(f'{name} snap size differs from its Store assertion')
+    actual_sha3 = sha3_384_file(snap)
+    if actual_sha3 != fields['snap-sha3-384']:
+        raise RuntimeError(f'{name} snap hash differs from its Store assertion')
+    unpack = runtime_work / f'{name}-unpacked'
+    complete = unpack / '.thin-client-extraction-complete'
+    if not complete.is_file():
+        if unpack.exists() or unpack.is_symlink():
+            if not unpack.is_dir() or unpack.is_symlink():
+                raise RuntimeError(f'Unexpected incomplete {name} extraction: {unpack}')
+            backup = runtime_work / f'{name}-unpacked.incomplete-{time.time_ns()}'
+            safe(unpack)
+            safe(backup)
+            unpack.rename(backup)
+            print(f'Retained incomplete {name} extraction: {backup}', flush=True)
+        # Base snaps contain /dev placeholders and root-only capability xattrs.
+        # The sandbox bind-mounts the post's real /dev, and Spotify does not need
+        # file capabilities, so omitting both is correct for an unprivileged
+        # extraction. -no-exit-code ignores only non-fatal placeholder errors;
+        # corrupt archives and other fatal extraction errors still stop here.
+        run(['unsquashfs', '-no-progress', '-no-xattrs', '-no-exit-code',
+             '-d', unpack, snap])
+        complete.write_text('Unprivileged extraction completed without xattrs/devices\n')
+    if not unpack.is_dir() or unpack.is_symlink():
+        raise RuntimeError(f'Unexpected {name} snap extraction')
+    validate_snap_tree(unpack, allow_external_links=True)
+    snap_yaml = unpack / 'meta/snap.yaml'
+    if not snap_yaml.is_file():
+        raise RuntimeError(f'{name} snap metadata is missing')
+    text = snap_yaml.read_text()
+    declared = re.search(r'^name:\s*([^#\n]+)', text, re.MULTILINE)
+    version = re.search(r'^version:\s*([^#\n]+)', text, re.MULTILINE)
+    declared = yaml_scalar(declared.group(1)) if declared else ''
+    version = yaml_scalar(version.group(1)) if version else ''
+    if declared != name or not re.fullmatch(r'[0-9A-Za-z.+_~-]+', version):
+        raise RuntimeError(f'Unexpected {name} snap name/version')
+    revision = fields['snap-revision']
+    release_name = f'{version}-snap-r{revision}'
+    destination = safe(root / 'apps/snap-runtimes' / name / 'releases' / release_name)
+    metadata = {
+        'backend': 'official-snap-runtime', 'name': name, 'version': version,
+        'revision': revision, 'snap_id': expected_id, 'sha3_384': actual_sha3,
+        'size': int(fields['snap-size']),
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        receipt = destination / '.thin-client-install.json'
+        if not receipt.is_file() or json.loads(receipt.read_text()) != metadata:
+            raise RuntimeError(f'Existing {name} runtime is incomplete/unrecognized: {destination}')
+        print(f'Already installed Spotify runtime: {destination}', flush=True)
+    else:
+        (unpack / '.thin-client-install.json').write_text(json.dumps(metadata, indent=2) + '\n')
+        unpack.rename(destination)
+        print(f'Installed Spotify runtime {name} {version}: {destination}', flush=True)
+    switch(root / 'apps/snap-runtimes' / name / 'current', destination)
+    return destination
+
+def install_spotify(root, work=None):
+    """Download and extract Spotify's verified official stable Snap without sudo."""
+    if os.uname().machine != 'x86_64':
+        raise RuntimeError('Spotify official client currently supports Linux x86_64 here')
+    for command in ('snap', 'unsquashfs'):
+        if not shutil.which(command):
+            raise RuntimeError(f'{command} is required to install the official Spotify Snap')
+    if (root / 'apps/spotify/current').exists():
+        stopped(('spotify',))
+    scratch = safe(root / 'tmp')
+    scratch.mkdir(parents=True, exist_ok=True)
+    if work is None:
+        # A failed unprivileged extraction leaves verified downloads in place.
+        # Resume the newest incomplete staging directory, while successful runs
+        # are marked complete so a later prepare can discover a newer release.
+        retained = sorted(
+            (item for item in scratch.glob('spotify-download-*')
+             if item.is_dir() and not item.is_symlink() and
+             not (item / '.thin-client-install-complete').exists() and
+             (item / 'spotify.snap').is_file() and
+             (item / 'spotify.assert').is_file()),
+            key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        work = retained[0] if retained else Path(
+            tempfile.mkdtemp(prefix='spotify-download-', dir=scratch))
+    safe(work)
+    print(f'Spotify download staging (retained on success/failure): {work}', flush=True)
+    snap = work / 'spotify.snap'
+    assertion = work / 'spotify.assert'
+    if not snap.is_file() or not assertion.is_file():
+        run(['snap', 'download', 'spotify', '--stable', '--basename=spotify',
+             f'--target-directory={work}'])
+    fields = spotify_assertion(assertion)
+    if snap.stat().st_size != int(fields['snap-size']):
+        raise RuntimeError('Spotify snap size differs from its Store assertion')
+    actual_sha3 = sha3_384_file(snap)
+    if actual_sha3 != fields['snap-sha3-384']:
+        raise RuntimeError('Spotify snap hash differs from its Store assertion')
+    unpack = work / 'spotify-unpacked'
+    if not unpack.exists():
+        run(['unsquashfs', '-no-progress', '-d', unpack, snap])
+    if not unpack.is_dir() or unpack.is_symlink():
+        raise RuntimeError('Unexpected Spotify snap extraction')
+    validate_snap_tree(unpack)
+    parsed = spotify_snap_metadata(unpack / 'meta/snap.yaml')
+    revision = fields['snap-revision']
+    release_name = f'{parsed["version"]}-snap-r{revision}'
+    destination = safe(root / 'apps/spotify/releases' / release_name)
+    metadata = {
+        'backend': 'official-spotify-snap', 'version': parsed['version'],
+        'revision': revision, 'snap_id': SPOTIFY_SNAP_ID,
+        'sha3_384': actual_sha3, 'size': int(fields['snap-size']),
+        'base': parsed['base'], 'command': parsed['command'],
+        'command_chain': parsed['command_chain'],
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        existing = destination / '.thin-client-install.json'
+        existing_metadata = json.loads(existing.read_text()) if existing.is_file() else {}
+        immutable_keys = ('backend', 'version', 'revision', 'snap_id',
+                          'sha3_384', 'size', 'base')
+        if (not existing.is_file() or
+                any(existing_metadata.get(key) != metadata.get(key)
+                    for key in immutable_keys)):
+            raise RuntimeError(f'Existing Spotify release is incomplete/unrecognized: {destination}')
+        if existing_metadata != metadata:
+            temporary = existing.with_name('.thin-client-install.json.pending')
+            temporary.write_text(json.dumps(metadata, indent=2) + '\n')
+            os.replace(temporary, existing)
+            print(f'Repaired Spotify launch metadata: {existing}', flush=True)
+        print(f'Already installed: {destination}', flush=True)
+    else:
+        (unpack / '.thin-client-install.json').write_text(json.dumps(metadata, indent=2) + '\n')
+        spotify_launch(root, unpack, metadata)
+        ensure_spotify_mountpoints(unpack)
+        unpack.rename(destination)
+        print(f'Installed official Spotify {parsed["version"]}: {destination}', flush=True)
+    switch(root / 'apps/spotify/current', destination)
+    print(f'Activated: {root / "apps/spotify/current"} -> {destination}', flush=True)
+    runtimes = {name: install_snap_runtime(root, name, work)
+                for name in SPOTIFY_RUNTIME_SNAP_IDS}
+    # Seed snap.yaml layout targets while goinfre is known to be writable.
+    # Later launches can then work from school posts that expose it read-only.
+    ensure_spotify_mountpoints(destination)
+    spotify_layout_mounts(runtimes['core24'], runtimes['gnome-46-2404'],
+                          runtimes['mesa-2404'])
+    (work / '.thin-client-install-complete').write_text(
+        'All Spotify application and runtime releases activated\n')
+
+def managed_shell_block(path, name, body):
+    """Append or replace one exact managed block without touching other shell setup."""
+    safe(path)
+    begin = f'# >>> thin-client {name} >>>'
+    end = f'# <<< thin-client {name} <<<'
+    original = path.read_text() if path.exists() else ''
+    if original.count(begin) != original.count(end) or original.count(begin) > 1:
+        raise RuntimeError(f'Malformed managed shell block in {path}')
+    block = f'{begin}\n{body.rstrip()}\n{end}'
+    if begin in original:
+        start = original.index(begin)
+        finish = original.index(end, start) + len(end)
+        contents = original[:start] + block + original[finish:]
+    else:
+        separator = '' if not original or original.endswith('\n\n') else ('\n' if original.endswith('\n') else '\n\n')
+        contents = original + separator + block + '\n'
+    if contents == original:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(contents)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+    print(f'Updated managed {name} block: {path}', flush=True)
+
+def install_pyenv_shell(root):
+    """Repair the school pyenv PATH ordering and prefer the managed installation."""
+    managed = Path(root) / 'apps/pyenv'
+    cache = Path(root) / 'cache/pyenv'
+    body = f'''# Keep this after school/Oh My Zsh PATH assignments.
+_thin_client_pyenv_root={shlex.quote(str(managed))}
+if [ ! -x "$_thin_client_pyenv_root/bin/pyenv" ] && [ -x /opt/pyenv/bin/pyenv ]; then
+  _thin_client_pyenv_root=/opt/pyenv
+fi
+# The school zshenv/profile initializes /opt/pyenv-virtualenv before user
+# startup files. When the managed core-only pyenv is available, detach that
+# old prompt hook and its shims so it cannot call the missing `sh-activate`.
+if [ "$_thin_client_pyenv_root" != /opt/pyenv ]; then
+  if [ -n "${{ZSH_VERSION:-}}" ]; then
+    precmd_functions=("${{precmd_functions[@]:#_pyenv_virtualenv_hook}}")
+    unfunction _pyenv_virtualenv_hook 2>/dev/null || true
+  fi
+  if [ -n "${{BASH_VERSION:-}}" ]; then
+    PROMPT_COMMAND="${{PROMPT_COMMAND//_pyenv_virtualenv_hook;/}}"
+    PROMPT_COMMAND="${{PROMPT_COMMAND//_pyenv_virtualenv_hook/}}"
+    unset -f _pyenv_virtualenv_hook 2>/dev/null || true
+  fi
+  unset PYENV_VIRTUALENV_INIT _PYENV_VH_PWD _PYENV_VH_VERSION
+  unset _PYENV_VH_VENV _PYENV_VH_PATHS _PYENV_VH_MTIMES
+  _thin_client_clean_path=
+  _thin_client_old_ifs=$IFS
+  IFS=:
+  for _thin_client_path in $PATH; do
+    case "$_thin_client_path" in
+      /opt/pyenv|/opt/pyenv/*) ;;
+      *) _thin_client_clean_path="${{_thin_client_clean_path:+$_thin_client_clean_path:}}$_thin_client_path" ;;
+    esac
+  done
+  IFS=$_thin_client_old_ifs
+  PATH=$_thin_client_clean_path
+  export PATH
+  unset _thin_client_clean_path _thin_client_old_ifs _thin_client_path
+fi
+if [ -x "$_thin_client_pyenv_root/bin/pyenv" ]; then
+  export PYENV_ROOT="$_thin_client_pyenv_root"
+  export PYTHON_BUILD_CACHE_PATH={shlex.quote(str(cache))}
+  export PATH="$PYENV_ROOT/bin:$PYENV_ROOT/shims:$PATH"
+  eval "$("$PYENV_ROOT/bin/pyenv" init - --no-rehash)"
+fi
+unset _thin_client_pyenv_root'''
+    # The account uses zsh, while bash remains useful for noninteractive school tooling.
+    for path in (HOME / '.zshrc', HOME / '.bashrc'):
+        managed_shell_block(path, 'pyenv', body)
+
+def install_pyenv(root, work):
+    """Install an immutable pyenv release in goinfre and integrate user shells."""
+    appdir = safe(root / 'apps/pyenv')
+    releases = safe(appdir / 'releases')
+    destination = safe(releases / PYENV_VERSION)
+    releases.mkdir(parents=True, exist_ok=True)
+    receipt_name = '.thin-client-pyenv.json'
+
+    def validate(path):
+        required = [path / 'bin/pyenv', path / 'libexec/pyenv',
+                    path / 'plugins/python-build/bin/python-build']
+        if not all(candidate.is_file() and os.access(candidate, os.X_OK)
+                   for candidate in required):
+            raise RuntimeError(f'Incomplete pyenv release: {path}')
+        version_file = path / 'libexec/pyenv---version'
+        if (not version_file.is_file() or
+                f'version="{PYENV_VERSION}"' not in version_file.read_text()):
+            raise RuntimeError(f'Unexpected pyenv version metadata: {path}')
+
+    if destination.exists():
+        receipt = destination / receipt_name
+        metadata = json.loads(receipt.read_text()) if receipt.is_file() else {}
+        if metadata != {'version': PYENV_VERSION, 'commit': PYENV_COMMIT}:
+            raise RuntimeError(f'Existing pyenv release is unmanaged: {destination}')
+        validate(destination)
+        print(f'Already installed: {destination}', flush=True)
+    else:
+        archive = work / 'pyenv.tar.gz'
+        fetch(f'https://github.com/pyenv/pyenv/archive/{PYENV_COMMIT}.tar.gz', archive)
+        unpack = work / 'pyenv-unpacked'
+        unpack.mkdir(mode=0o700)
+        extract(archive, unpack, 'tar')
+        children = list(unpack.iterdir())
+        if len(children) != 1 or not children[0].is_dir():
+            raise RuntimeError('Unexpected pyenv archive layout')
+        validate(children[0])
+        (children[0] / receipt_name).write_text(json.dumps({
+            'version': PYENV_VERSION, 'commit': PYENV_COMMIT}, indent=2) + '\n')
+        children[0].rename(destination)
+        print(f'Installed pinned pyenv {PYENV_VERSION}: {destination}', flush=True)
+    switch(appdir / 'current', destination)
+    for directory in ('versions', 'shims', 'cache'):
+        safe(appdir / directory).mkdir(parents=True, exist_ok=True)
+    # PYENV_ROOT remains the stable app directory. Only pyenv's program files
+    # follow current; installed Python versions and shims survive pyenv updates.
+    for name in ('bin', 'libexec', 'plugins', 'pyenv.d', 'completions'):
+        link = appdir / name
+        target = Path('current') / name
+        if link.is_symlink():
+            if os.readlink(link) != str(target):
+                raise RuntimeError(f'Unexpected pyenv program link: {link}')
+        elif link.exists():
+            raise RuntimeError(f'Existing data blocks managed pyenv link: {link}')
+        else:
+            link.symlink_to(target)
+    install_pyenv_shell(root)
+    print(f'Activated pyenv {PYENV_VERSION}; Python versions: {appdir / "versions"}', flush=True)
+
 def install(root):
     if os.uname().machine != 'x86_64':
         raise RuntimeError('This release currently supports Linux x86_64 only')
@@ -324,13 +1028,234 @@ def install(root):
     meta = json.loads(text_url('https://update.code.visualstudio.com/api/update/linux-x64/stable/latest', work, 'vscode-meta.json'))
     install_app(root, 'brave', version, url, sha, 'zip', work)
     install_app(root, 'vscode', meta['productVersion'], meta['url'], meta['sha256hash'], 'tar', work)
+    install_spotify(root, work)
+    install_pyenv(root, work)
+    install_coding_clis(root, work)
 
-def cache_link(path, target):
+def confined_executable(path, directory):
+    """Return an executable only when its resolved target remains in directory."""
+    if not path.exists() or not os.access(path, os.X_OK):
+        raise RuntimeError(f'Missing executable: {path}')
+    resolved = path.resolve()
+    if not resolved.is_relative_to(directory.resolve()):
+        raise RuntimeError(f'Executable escapes its managed goinfre directory: {path}')
+    return resolved
+
+def compatibility_launcher(name, launcher):
+    """Expose a managed ~/.local/bin launcher through school images' ~/bin."""
+    compatibility = HOME / 'bin' / name
+    compatibility.parent.mkdir(parents=True, exist_ok=True)
+    managed_file(compatibility,
+                 '#!/bin/sh\n# Managed by thin-client-setup\n'
+                 f'exec {shlex.quote(str(launcher))} "$@"\n', 0o755)
+
+def cli_wrapper(name):
+    """Install a small persistent launcher; preserve unrelated user commands."""
+    path = HOME / '.local/bin' / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        target = path.resolve(strict=False)
+        official = (HOME / ('.codex/packages/standalone' if name == 'codex'
+                            else '.local/share/claude/versions')).resolve()
+        if not target.is_relative_to(official):
+            raise RuntimeError(f'Refusing to replace unrelated command link: {path} -> {target}')
+        path.unlink()
+        print(f'Replaced recognized official {name} launcher; its old package files were retained',
+              flush=True)
+    managed_file(path,
+                 '#!/bin/sh\n# Managed by thin-client-setup\n'
+                 f'exec {shlex.quote(str(SELF))} open {name} "$@"\n', 0o755)
+    # Some school images reset PATH after login and omit ~/.local/bin, while
+    # retaining ~/bin as their first entry.  Keep the real managed launcher in
+    # ~/.local/bin and add the same tiny shim in the already-supported ~/bin.
+    compatibility_launcher(name, path)
+
+def verify_claude_manifest(work, manifest, signature):
+    """Verify Anthropic's signed manifest with an isolated temporary keyring."""
+    key = work / 'claude-code.asc'
+    fetch('https://downloads.claude.ai/keys/claude-code.asc', key)
+    gnupg = work / 'gnupg'
+    gnupg.mkdir(mode=0o700)
+    run(['gpg', '--batch', '--homedir', gnupg, '--import', key],
+        capture_output=True, text=True)
+    listing = run(['gpg', '--batch', '--homedir', gnupg, '--with-colons',
+                   '--fingerprint', 'security@anthropic.com'], capture_output=True, text=True)
+    fingerprints = [line.split(':')[9].upper() for line in listing.stdout.splitlines()
+                    if line.startswith('fpr:') and len(line.split(':')) > 9]
+    if CLAUDE_SIGNING_FINGERPRINT not in fingerprints:
+        raise RuntimeError('Anthropic release signing-key fingerprint did not match')
+    run(['gpg', '--batch', '--homedir', gnupg, '--verify', signature, manifest],
+        capture_output=True, text=True)
+    print('Verified Anthropic signature on Claude Code release manifest', flush=True)
+
+def install_claude(root, work):
+    base = 'https://downloads.claude.ai/claude-code-releases'
+    version = text_url(base + '/latest', work, 'claude-version')
+    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+        raise RuntimeError('Invalid Claude Code version')
+    manifest_path = work / 'claude-manifest.json'
+    signature = work / 'claude-manifest.json.sig'
+    fetch(f'{base}/{version}/manifest.json', manifest_path)
+    fetch(f'{base}/{version}/manifest.json.sig', signature)
+    verify_claude_manifest(work, manifest_path, signature)
+    manifest = json.loads(manifest_path.read_text())
+    platform = manifest.get('platforms', {}).get('linux-x64', {})
+    checksum = platform.get('checksum', '')
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', checksum):
+        raise RuntimeError('Claude manifest has no valid linux-x64 checksum')
+    appdir = safe(root / 'apps/claude')
+    releases = safe(appdir / 'releases')
+    dest = safe(releases / version)
+    releases.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        receipt = json.loads((dest / '.thin-client-install.json').read_text())
+        if receipt.get('sha256') != checksum.lower():
+            raise RuntimeError(f'Existing Claude release is unrecognized: {dest}')
+        confined_executable(dest / 'claude', dest)
+        print(f'Already installed: {dest}', flush=True)
+    else:
+        download = work / 'claude'
+        fetch(f'{base}/{version}/linux-x64/claude', download)
+        verify_checksum(download, checksum)
+        if isinstance(platform.get('size'), int) and download.stat().st_size != platform['size']:
+            raise RuntimeError('Claude binary size does not match signed manifest')
+        stage = work / 'claude-unpacked'
+        stage.mkdir(mode=0o700)
+        binary = stage / 'claude'
+        download.replace(binary)
+        binary.chmod(0o755)
+        (stage / '.thin-client-install.json').write_text(json.dumps({
+            'version': version, 'sha256': checksum.lower(),
+            'url': f'{base}/{version}/linux-x64/claude'}, indent=2) + '\n')
+        stage.rename(dest)
+        print(f'Installed new release: {dest}', flush=True)
+    switch(appdir / 'current', dest)
+    print(f'Activated: {appdir / "current"} -> {dest}', flush=True)
+
+def install_codex(root, work):
+    """Run OpenAI's official installer with both package roots confined to goinfre."""
+    appdir = safe(root / 'apps/codex')
+    package_home = safe(appdir / 'installer-home')
+    bindir = safe(appdir / 'bin')
+    package_home.mkdir(parents=True, exist_ok=True)
+    bindir.mkdir(parents=True, exist_ok=True)
+    installer = work / 'codex-install.sh'
+    fetch('https://chatgpt.com/codex/install.sh', installer)
+    env = dict(os.environ)
+    env.update({'CODEX_HOME': str(package_home), 'CODEX_INSTALL_DIR': str(bindir),
+                'CODEX_NON_INTERACTIVE': '1'})
+    cli_stopped('codex')
+    run(['/bin/sh', installer], env=env)
+    executable = confined_executable(bindir / 'codex', appdir)
+    daemon = package_home / 'packages/app-server-daemon/current/bin/codex'
+    if not os.access(daemon, os.X_OK):
+        run([executable, 'app-server', 'daemon', 'start'], env=env)
+        if not os.access(daemon, os.X_OK):
+            raise RuntimeError('Official Codex installer did not provision the app-server daemon')
+        run([executable, 'app-server', 'daemon', 'stop'], env=env)
+        print(f'Provisioned Codex app-server daemon: {daemon}', flush=True)
+    print(f'Installed/updated Codex CLI packages in disposable storage: {appdir}', flush=True)
+
+def cli_stopped(name):
+    """Refuse package relocation while this user's CLI processes are running."""
+    r = run(['ps', '-eo', 'uid=,pid=,comm='], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        fields = line.split()
+        if (len(fields) == 3 and fields[0] == str(os.getuid()) and
+                fields[2].lower().startswith(name)):
+            raise RuntimeError(f'Quit every {name} process before relocating packages: '
+                               f'{fields[2]} PID {fields[1]}')
+
+def copy_codex_runtime_packages(source, target):
+    """Copy non-standalone runtime packages and verify them before activation."""
+    run(['rsync', '-a', '--exclude=/standalone/', str(source) + '/', str(target) + '/'])
+    verify = run(['rsync', '-anc', '--itemize-changes', '--exclude=/standalone/',
+                  str(source) + '/', str(target) + '/'], capture_output=True, text=True)
+    if verify.stdout.strip():
+        raise RuntimeError('Codex runtime-package verification failed')
+
+def relocate_codex_packages(root):
+    """Keep Codex state in HOME but redirect its reproducible packages to goinfre."""
+    state = safe(HOME / '.codex')
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    source = state / 'packages'
+    target = safe(root / 'apps/codex/installer-home/packages')
+    target.mkdir(parents=True, exist_ok=True)
+    if source.is_symlink():
+        if source.resolve() != target.resolve():
+            raise RuntimeError(f'Unexpected Codex package link: {source} -> {source.resolve()}')
+        daemon = target / 'app-server-daemon/current/bin/codex'
+        if not os.access(daemon, os.X_OK):
+            candidates = sorted((root / 'legacy-backups').glob(
+                'codex-packages-*/app-server-daemon'), reverse=True)
+            if not candidates:
+                raise RuntimeError('Codex daemon package is missing and no recovery copy was found')
+            cli_stopped('codex')
+            copy_codex_runtime_packages(candidates[0].parent, target)
+            if not os.access(daemon, os.X_OK):
+                raise RuntimeError('Recovered Codex daemon package is not executable')
+            print(f'Restored Codex daemon package from {candidates[0].parent}', flush=True)
+        return
+    if not source.exists():
+        source.symlink_to(target)
+        print(f'Linked disposable Codex packages: {source} -> {target}', flush=True)
+        return
+    if not source.is_dir() or source.is_mount():
+        raise RuntimeError(f'Codex packages must be a real unmounted directory: {source}')
+    cli_stopped('codex')
+    backups = safe(root / 'legacy-backups')
+    backups.mkdir(parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix=f'codex-packages-{time.strftime("%Y%m%d-%H%M%S")}-',
+                                   dir=backups))
+    run(['rsync', '-a', str(source) + '/', str(backup) + '/'])
+    verify = run(['rsync', '-anc', '--itemize-changes',
+                  str(source) + '/', str(backup) + '/'], capture_output=True, text=True)
+    if verify.stdout.strip():
+        raise RuntimeError('Codex package backup verification failed; HOME packages were retained')
+    (backup / '.thin-client-codex-package-backup.json').write_text(json.dumps({
+        'source': str(source), 'created': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+        'reason': 'reproducible packages relocated from persistent HOME'
+    }, indent=2) + '\n')
+    copy_codex_runtime_packages(source, target)
+    # Only this exact reproducible package tree is removed, after a verified
+    # goinfre backup. Auth, configuration, sessions, skills and databases remain.
+    safe(source)
+    print(f'Removing verified HOME package copy only: {source}', flush=True)
+    shutil.rmtree(source)
+    source.symlink_to(target)
+    print(f'Linked disposable Codex packages: {source} -> {target}; '
+          f'temporary recovery copy retained at {backup}', flush=True)
+
+def install_coding_clis(root, work=None, only=None):
+    if os.uname().machine != 'x86_64':
+        raise RuntimeError('Codex/Claude installation currently supports Linux x86_64 only')
+    safe(root / 'tmp').mkdir(parents=True, exist_ok=True)
+    if work is None:
+        work = Path(tempfile.mkdtemp(prefix='cli-download-', dir=root / 'tmp'))
+        print(f'CLI download staging (retained on success/failure): {work}', flush=True)
+    selected = [only] if only else ['codex', 'claude']
+    if 'codex' in selected:
+        install_codex(root, work)
+    if 'claude' in selected:
+        install_claude(root, work)
+    for name in selected:
+        state = safe(HOME / ('.codex' if name == 'codex' else '.claude'))
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if name == 'codex':
+            relocate_codex_packages(root)
+        cli_wrapper(name)
+
+def cache_link(path, target, managed_alternates=()):
     safe(path.parent)
     safe(target).mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         if path.resolve() != target.resolve():
-            raise RuntimeError(f'Unexpected cache link: {path}')
+            allowed = {Path(candidate).resolve() for candidate in managed_alternates}
+            if path.resolve() not in allowed:
+                raise RuntimeError(f'Unexpected cache link: {path}')
+            path.unlink()
+            path.symlink_to(target)
+            print(f'Switched disposable cache for this post: {path} -> {target}', flush=True)
     elif path.exists():
         raise RuntimeError(f'Existing data blocks cache redirection (left intact): {path}')
     else:
@@ -339,20 +1264,25 @@ def cache_link(path, target):
 
 def vscode_caches(root):
     safe(CODE)
+    storage = runtime_storage(root)
     for name in CODE_CACHES:
-        cache_link(CODE / name, root / 'cache/vscode' / name)
+        relative = Path('cache/vscode') / name
+        cache_link(CODE / name, storage / relative, (
+            root / relative, transient_runtime_path() / relative))
 
-def brave_cache_link(path, target, root):
-    """Preserve allowlisted caches in goinfre before redirecting exact locations."""
-    relative = path.relative_to(BRAVE)
+def chromium_cache_link(profile_root, path, target, root, managed_alternates=(),
+                        storage=None, label='Chromium'):
+    """Preserve allowlisted Chromium caches before redirecting exact locations."""
+    relative = path.relative_to(profile_root)
     parts = relative.parts
     approved = (relative in BRAVE_ROOT_DISPOSABLE_CACHE_PATHS or
                 (len(parts) == 2 and
                  (parts[0] == 'Default' or re.fullmatch(r'Profile [0-9]+', parts[0])) and
-                 Path(parts[1]) in BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS))
+                 Path(parts[1]) in (BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS +
+                                    BRAVE_LEGACY_PROFILE_CACHE_LINKS)))
     if not approved:
-        raise RuntimeError(f'Unapproved Brave cache path (left intact): {path}')
-    safe(BRAVE)
+        raise RuntimeError(f'Unapproved {label} cache path (left intact): {path}')
+    safe(profile_root)
     safe(path.parent)
     if path.exists() and not path.is_symlink():
         if not path.is_dir() or path.is_mount():
@@ -361,35 +1291,41 @@ def brave_cache_link(path, target, root):
                                'may be relocated, and they must be real directories, not mounts')
         if root.name != 'thin-client':
             raise RuntimeError(f'Unexpected thin-client root: {root}')
-        validate_goinfre(root.parent, HOME)
+        validate_goinfre(root.parent, HOME, require_writable=False)
         safe(root)
         safe(target).mkdir(parents=True, exist_ok=True)
         stopped(('brave',))
         safe(path)
         if not path.is_dir() or path.is_symlink() or path.is_mount():
-            raise RuntimeError(f'Brave cache changed during stopped check (left intact): {path}')
+            raise RuntimeError(f'{label} cache changed during stopped check (left intact): {path}')
         # Refuse profile/cache mount escapes, including mounted trees within a cache.
-        for parent in [BRAVE, *path.parents]:
-            if parent == BRAVE or BRAVE in parent.parents:
+        for parent in [profile_root, *path.parents]:
+            if parent == profile_root or profile_root in parent.parents:
                 if parent.is_mount():
-                    raise RuntimeError(f'Mount in Brave cache path (left intact): {parent}')
+                    raise RuntimeError(f'Mount in {label} cache path (left intact): {parent}')
         def walk_error(error):
-            raise RuntimeError(f'Cannot inspect Brave cache safely (left intact): {error.filename}') from error
+            raise RuntimeError(f'Cannot inspect {label} cache safely '
+                               f'(left intact): {error.filename}') from error
         for directory, dirs, _ in os.walk(path, followlinks=False, onerror=walk_error):
             for name in dirs:
                 child = Path(directory) / name
                 if not child.is_symlink() and child.is_mount():
-                    raise RuntimeError(f'Mount inside Brave cache (left intact): {child}')
-        backups = safe(root / 'cache-backups')
+                    raise RuntimeError(f'Mount inside {label} cache (left intact): {child}')
+        backups = safe((storage or root) / 'cache-backups')
         backups.mkdir(parents=True, exist_ok=True)
-        backup = Path(tempfile.mkdtemp(prefix='brave-', dir=backups)) / path.name
-        print(f'Relocating stopped Brave cache: {path} -> {backup}', flush=True)
+        backup = Path(tempfile.mkdtemp(prefix=label.lower() + '-', dir=backups)) / path.name
+        print(f'Relocating stopped {label} cache: {path} -> {backup}', flush=True)
         # HOME and goinfre are separate filesystems: copy before removing the
         # source. shutil.move preserves nested symlinks and retains the source
         # if copying fails; backups are never automatically pruned.
         shutil.move(str(path), str(backup))
-        print(f'Preserved Brave cache: {path} -> {backup}', flush=True)
-    cache_link(path, target)
+        print(f'Preserved {label} cache: {path} -> {backup}', flush=True)
+    cache_link(path, target, managed_alternates)
+
+def brave_cache_link(path, target, root, managed_alternates=(), storage=None):
+    """Compatibility wrapper for the normal Brave profile cache policy."""
+    return chromium_cache_link(BRAVE, path, target, root, managed_alternates,
+                               storage, 'Brave')
 
 def brave_disposable_relative_paths(profile_root):
     """Construct exact paths; inspect only immediate children to find profiles."""
@@ -399,6 +1335,9 @@ def brave_disposable_relative_paths(profile_root):
             if (profile.name == 'Default' or re.fullmatch(r'Profile [0-9]+', profile.name)) and profile.is_dir():
                 for relative in BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS:
                     yield Path(profile.name) / relative
+                for relative in BRAVE_LEGACY_PROFILE_CACHE_LINKS:
+                    if (profile / relative).is_symlink():
+                        yield Path(profile.name) / relative
 
 def brave_copy_excludes(profile_root):
     # Leading / anchors each exclusion to the source profile root. Trailing /
@@ -408,9 +1347,62 @@ def brave_copy_excludes(profile_root):
 
 def brave_caches(root):
     safe(BRAVE)
+    storage = runtime_storage(root)
     if BRAVE.is_dir():
         for relative in brave_disposable_relative_paths(BRAVE):
-            brave_cache_link(BRAVE / relative, root / 'cache/brave-profile' / relative, root)
+            cache_relative = Path('cache/brave-profile') / relative
+            brave_cache_link(BRAVE / relative, storage / cache_relative, root, (
+                root / cache_relative, transient_runtime_path() / cache_relative), storage)
+
+def spotify_caches(root):
+    """Prepare disposable cache space used by the official Spotify client."""
+    safe(SPOTIFY)
+    storage = runtime_storage(root)
+    safe(storage / 'cache/spotify').mkdir(parents=True, exist_ok=True)
+
+def repair_spotify_login(root):
+    """Archive one unwanted login and its cache, leaving a clean sign-in state."""
+    stopped(('spotify',))
+    if not (SPOTIFY / '.thin-client-import').is_file():
+        raise RuntimeError('Spotify profile is not managed; run spotify prepare first')
+    safe(SPOTIFY)
+    backups = safe(root / 'legacy-backups')
+    backups.mkdir(parents=True, exist_ok=True)
+    destination = Path(tempfile.mkdtemp(
+        prefix=time.strftime('spotify-login-%Y%m%d-%H%M%S-'), dir=backups))
+    sources = (
+        (SPOTIFY / '.config/spotify', destination / 'spotify-config'),
+        (SPOTIFY / '.config/spotify~', destination / 'spotify-config-legacy'),
+        (SPOTIFY / '.local/share/keyrings', destination / 'isolated-keyrings'),
+        (safe(root / 'cache/spotify'), destination / 'spotify-cache'),
+    )
+    moved = False
+    for source, target in sources:
+        if source.exists() or source.is_symlink():
+            safe(source)
+            shutil.move(str(source), str(target))
+            moved = True
+    if not moved:
+        destination.rmdir()
+        print('Spotify already has a clean sign-in state.', flush=True)
+        return
+    spotify_caches(root)
+    print(f'Archived the previous Spotify login/cache: {destination}', flush=True)
+    print('Spotify will request a fresh login on its next launch.', flush=True)
+
+def migrate_spotify():
+    """Prepare isolated persistent state for the official Spotify client."""
+    install_spotify_open_helper()
+    install_spotify_snapctl_helper()
+    safe(SPOTIFY)
+    marker = SPOTIFY / '.thin-client-import'
+    if marker.is_file():
+        return
+    if SPOTIFY.exists():
+        raise RuntimeError(f'Existing Spotify-Thin data left intact; manual review required: {SPOTIFY}')
+    SPOTIFY.mkdir(parents=True, mode=0o700)
+    marker.write_text('New isolated official Spotify client profile\n')
+    print(f'Prepared persistent Spotify profile: {SPOTIFY}', flush=True)
 
 def migrate(root):
     stopped()
@@ -429,8 +1421,10 @@ def migrate(root):
             migrate_brave(stage)
     if not (CODE / '.thin-client-import').exists():
         migrate_code()
+    migrate_spotify()
     vscode_caches(root)
     brave_caches(root)
+    spotify_caches(root)
 
 def migrate_brave(stage):
     safe(OLD_BRAVE)
@@ -496,52 +1490,401 @@ def migrate_code():
 
 def environment(root, app):
     env = dict(os.environ)
+    storage = runtime_storage(root)
     env['XDG_CONFIG_HOME'] = str(HOME / '.config')
     env['XDG_DATA_HOME'] = str(HOME / '.local/share')
-    env['XDG_CACHE_HOME'] = str(root / 'cache' / app)
-    env['TMPDIR'] = str(root / 'tmp')
-    paths = [root / 'cache' / app, root / 'tmp']
+    env['XDG_CACHE_HOME'] = str(storage / 'cache' / app)
+    env['TMPDIR'] = str(storage / 'tmp')
+    paths = [storage / 'cache' / app, storage / 'tmp']
     if app == 'vscode':
         # xdg-open's generic fallback can honor BROWSER. Use desktop handlers
         # for native Code, without forcing a browser or changing the shell.
         env.pop('BROWSER', None)
-        paths.append(root / 'vscode-extensions')
+        extensions = vscode_extensions()
+        extensions.mkdir(parents=True, exist_ok=True)
     for p in paths:
         safe(p).mkdir(parents=True, exist_ok=True)
     return env
 
 def code_args(root):
     return [root / 'apps/vscode/current/bin/code', '--user-data-dir', CODE,
-            '--extensions-dir', root / 'vscode-extensions']
+            '--extensions-dir', vscode_extensions()]
 
-def integrate(root):
-    if not (CODE / '.thin-client-import').exists() or not (BRAVE / '.thin-client-import').exists():
-        raise RuntimeError('Complete migration before integration')
-    stopped()
+def gpu_render_available():
+    """Only claim hardware acceleration when a usable DRM render node exists."""
+    dri = Path('/dev/dri')
+    if not dri.is_dir():
+        return False
+    return any(candidate.is_char_device() and os.access(candidate, os.R_OK | os.W_OK)
+               for candidate in dri.glob('renderD*'))
+
+def gpu_args():
+    if not gpu_render_available():
+        return []
+    return ['--ignore-gpu-blocklist', '--enable-gpu-rasterization', '--enable-zero-copy']
+
+def islands_dark_source(root):
+    """Fetch and validate the pinned upstream theme without running its scripts."""
+    sources = safe(STATE / 'theme-sources/islands-dark')
+    source = safe(sources / ISLANDS_DARK_COMMIT)
+
+    def validate(path):
+        package_path = path / 'package.json'
+        settings_path = path / 'settings.json'
+        theme_path = path / 'themes/islands-dark.json'
+        if not all(p.is_file() for p in [package_path, settings_path, theme_path]):
+            raise RuntimeError(f'Incomplete Islands Dark source: {path}')
+        package = json.loads(package_path.read_text())
+        expected = ('bwya77', 'islands-dark', ISLANDS_DARK_VERSION)
+        actual = (package.get('publisher'), package.get('name'), package.get('version'))
+        themes = package.get('contributes', {}).get('themes', [])
+        if actual != expected or not any(t.get('label') == 'Islands Dark' and
+                                         t.get('path') == './themes/islands-dark.json'
+                                         for t in themes if isinstance(t, dict)):
+            raise RuntimeError('Unexpected Islands Dark extension metadata')
+        parse_jsonc(settings_path.read_text())
+        return package
+
+    def persist(candidate):
+        """Copy through HOME so final activation never crosses filesystems."""
+        validate(candidate)
+        pending = Path(tempfile.mkdtemp(prefix=f'.{ISLANDS_DARK_COMMIT}-', dir=sources))
+        try:
+            shutil.copytree(candidate, pending, dirs_exist_ok=True, symlinks=True)
+            validate(pending)
+            pending.rename(source)
+        except Exception:
+            if pending.exists():
+                shutil.rmtree(pending)
+            raise
+        print(f'Installed pinned Islands Dark source: {source}', flush=True)
+        return source
+
+    if source.exists():
+        validate(source)
+        return source
+    sources.mkdir(parents=True, exist_ok=True)
+    scratch = safe(runtime_storage(root) / 'tmp')
+    scratch.mkdir(parents=True, exist_ok=True)
+    # A previous run may have downloaded and validated the archive but failed
+    # while activating it. Reuse that retained staging instead of downloading.
+    retained_roots = [scratch]
+    root_scratch = Path(root) / 'tmp'
+    if root_scratch.is_dir() and root_scratch.resolve() != scratch.resolve():
+        retained_roots.append(root_scratch)
+    retained = sorted(candidate for directory in retained_roots for candidate in directory.glob(
+        f'islands-dark-*/unpacked/vscode-dark-islands-{ISLANDS_DARK_COMMIT}'))
+    for candidate in reversed(retained):
+        try:
+            validate(candidate)
+        except (OSError, RuntimeError, json.JSONDecodeError):
+            continue
+        return persist(candidate)
+    work = Path(tempfile.mkdtemp(prefix='islands-dark-', dir=scratch))
+    archive = work / 'source.tar.gz'
+    url = ('https://github.com/bwya77/vscode-dark-islands/archive/'
+           f'{ISLANDS_DARK_COMMIT}.tar.gz')
+    fetch(url, archive)
+    unpack = work / 'unpacked'
+    unpack.mkdir(mode=0o700)
+    extract(archive, unpack, 'tar')
+    children = list(unpack.iterdir())
+    if len(children) != 1 or not children[0].is_dir():
+        raise RuntimeError('Unexpected Islands Dark archive layout')
+    return persist(children[0])
+
+def install_islands_dark_files(root, source):
+    """Install the unpacked color theme, fonts and Code-Thin settings."""
+    extension_root = vscode_extensions()
+    extension_root.mkdir(parents=True, exist_ok=True)
+    destination = safe(extension_root / f'bwya77.islands-dark-{ISLANDS_DARK_VERSION}')
+    receipt_name = '.thin-client-islands-dark.json'
+    install_extension = True
+    if destination.exists():
+        receipt = destination / receipt_name
+        try:
+            installed = json.loads(receipt.read_text()) if receipt.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            installed = {}
+        if (installed.get('repository') !=
+                'https://github.com/bwya77/vscode-dark-islands' or
+                installed.get('version') != ISLANDS_DARK_VERSION or
+                installed.get('commit') not in ISLANDS_DARK_MANAGED_COMMITS):
+            raise RuntimeError(f'Existing Islands Dark extension is unmanaged: {destination}')
+        install_extension = installed.get('commit') != ISLANDS_DARK_COMMIT
+    if install_extension:
+        # Stage beside the final extension so activation remains an atomic HOME
+        # rename even when scratch storage is on goinfre or /tmp.
+        stage = Path(tempfile.mkdtemp(prefix='.islands-extension-', dir=extension_root))
+        shutil.copy2(source / 'package.json', stage / 'package.json')
+        shutil.copytree(source / 'themes', stage / 'themes')
+        if (source / 'icon.png').is_file():
+            shutil.copy2(source / 'icon.png', stage / 'icon.png')
+        (stage / receipt_name).write_text(json.dumps({
+            'repository': 'https://github.com/bwya77/vscode-dark-islands',
+            'commit': ISLANDS_DARK_COMMIT,
+            'version': ISLANDS_DARK_VERSION,
+        }, indent=2) + '\n')
+        # Only a receipt from one of our immutable earlier revisions reaches
+        # this branch. The extension is reproducible; persistent settings are
+        # separate and are not removed here.
+        if destination.exists():
+            shutil.rmtree(destination)
+        stage.rename(destination)
+        print(f'Installed/updated Islands Dark extension: {destination}', flush=True)
+
+    # VS Code regenerates this cache; preserve the pre-theme copy once, then
+    # remove the stale inventory so the manually installed theme is discovered.
+    inventory = extension_root / 'extensions.json'
+    if inventory.exists():
+        if not inventory.is_file() or inventory.is_symlink():
+            raise RuntimeError(f'Unexpected VS Code extension inventory: {inventory}')
+        backup = STATE / 'extensions.pre-islands-dark.json'
+        if not backup.exists():
+            shutil.copy2(inventory, backup)
+        inventory.unlink()
+
+    fonts = safe(STATE / 'fonts/islands-dark')
+    fonts.mkdir(parents=True, exist_ok=True)
+    fonts_changed = False
+    for font in sorted((source / 'fonts').glob('*.otf')):
+        target = fonts / font.name
+        if not target.exists() or digest(target) != digest(font):
+            temporary = target.with_name('.' + target.name + '.pending')
+            shutil.copy2(font, temporary)
+            os.replace(temporary, target)
+            fonts_changed = True
+    fontconfig = HOME / '.config/fontconfig/conf.d/50-thin-client-islands-dark.conf'
+    safe(fontconfig.parent).mkdir(parents=True, exist_ok=True)
+    escaped_fonts = (str(fonts).replace('&', '&amp;').replace('<', '&lt;')
+                     .replace('>', '&gt;'))
+    fontconfig_contents = ('<?xml version="1.0"?>\n<!-- # Managed by thin-client-setup -->\n'
+                           '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">\n'
+                           f'<fontconfig><dir>{escaped_fonts}</dir></fontconfig>\n')
+    fontconfig_changed = not fontconfig.exists() or fontconfig.read_text() != fontconfig_contents
+    managed_file(fontconfig, fontconfig_contents, 0o644)
+
+    settings = CODE / 'User/settings.json'
+    safe(settings.parent).mkdir(parents=True, exist_ok=True)
+    current = parse_jsonc(settings.read_text()) if settings.exists() else {}
+    theme = parse_jsonc((source / 'settings.json').read_text())
+    backup = STATE / 'settings.pre-islands-dark.jsonc'
+    if settings.exists() and not backup.exists():
+        shutil.copy2(settings, backup)
+    merged = dict(current)
+    merged.update(theme)
+    merged.update(ISLANDS_DARK_COMFORT_SETTINGS)
+    watcher_excludes = {}
+    for configured in (current.get('files.watcherExclude'),
+                       theme.get('files.watcherExclude')):
+        if isinstance(configured, dict):
+            watcher_excludes.update(configured)
+    watcher_excludes.update(ISLANDS_DARK_COMFORT_SETTINGS['files.watcherExclude'])
+    merged['files.watcherExclude'] = watcher_excludes
+    stylesheet = {}
+    for configured in (current.get('custom-ui-style.stylesheet'),
+                       theme.get('custom-ui-style.stylesheet')):
+        if isinstance(configured, dict):
+            stylesheet.update(configured)
+    stylesheet.update(ISLANDS_DARK_LOW_LATENCY_STYLES)
+    merged['custom-ui-style.stylesheet'] = stylesheet
+    colors = {}
+    for configured in (current.get('workbench.colorCustomizations'),
+                       theme.get('workbench.colorCustomizations')):
+        if isinstance(configured, dict):
+            colors.update(configured)
+    islands_colors = colors.get('[Islands Dark]', {})
+    islands_colors = dict(islands_colors) if isinstance(islands_colors, dict) else {}
+    islands_colors.update(ISLANDS_DARK_COMFORT_COLORS)
+    colors['[Islands Dark]'] = islands_colors
+    merged['workbench.colorCustomizations'] = colors
+    contents = json.dumps(merged, indent=2) + '\n'
+    if not settings.exists() or settings.read_text() != contents:
+        fd, temporary = tempfile.mkstemp(prefix='.settings-', dir=settings.parent)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(contents)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, settings)
+        print(f'Applied Islands Dark settings (previous copy: {backup})', flush=True)
+    if (fonts_changed or fontconfig_changed) and shutil.which('fc-cache'):
+        run(['fc-cache', '-f'], env=environment(root, 'vscode'))
+
+def install_vscode_theme(root):
+    """Install the complete Islands Dark setup into the managed Code instance."""
+    if not (CODE / '.thin-client-import').exists():
+        raise RuntimeError('Complete VS Code migration before installing the theme')
+    executable = root / 'apps/vscode/current/bin/code'
+    if not os.access(executable, os.X_OK):
+        raise RuntimeError('VS Code is missing: run thin-client-setup prepare first')
+    stopped(('vscode',))
     vscode_caches(root)
-    brave_caches(root)
+    vscode_extensions().mkdir(parents=True, exist_ok=True)
     env = environment(root, 'vscode')
+    # Install the requested theme itself before Marketplace companions. This
+    # leaves a usable color theme if a school proxy temporarily blocks the
+    # Marketplace while GitHub remains reachable; rerunning completes the rest.
+    source = islands_dark_source(root)
+    install_islands_dark_files(root, source)
     for ext in EXTENSIONS:
         run([*code_args(root), '--install-extension', ext], env=env)
     print('Local extension inventory:', flush=True)
     run([*code_args(root), '--list-extensions', '--show-versions'], env=env)
-    desktop_integration()
+    print('Islands Dark installed. On first launch run "Custom UI Style: Reload" '
+          'from the Command Palette to activate the rounded-panel CSS.', flush=True)
 
-def desktop_integration():
+def integrate(root):
+    if (not (CODE / '.thin-client-import').exists() or
+            not (BRAVE / '.thin-client-import').exists() or
+            not (SPOTIFY / '.thin-client-import').exists()):
+        raise RuntimeError('Complete migration before integration')
+    stopped()
+    brave_caches(root)
+    spotify_caches(root)
+    install_vscode_theme(root)
+    desktop_integration(root)
+
+def desktop_icon(root, app):
+    """Copy a vendor icon into persistent HOME for cross-post desktop menus."""
+    sources = {
+        'brave': root / 'apps/brave/current/product_logo_256.png',
+        'code': root / 'apps/vscode/current/resources/app/resources/linux/code.png',
+    }
+    source = sources[app]
+    app_root = (root / 'apps' / ('brave' if app == 'brave' else 'vscode')).resolve()
+    if (not source.is_file() or source.is_symlink() or
+            not source.resolve().is_relative_to(app_root)):
+        raise RuntimeError(f'Missing or unexpected {app} desktop icon: {source}')
+    icons = safe(STATE / 'icons')
+    icons.mkdir(parents=True, exist_ok=True)
+    destination = safe(icons / f'{app}-native.png')
+    if not destination.exists() or digest(destination) != digest(source):
+        temporary = destination.with_name('.' + destination.name + '.pending')
+        shutil.copy2(source, temporary)
+        temporary.chmod(0o644)
+        os.replace(temporary, destination)
+        print(f'Installed persistent desktop icon: {destination}', flush=True)
+    return destination
+
+def spotify_desktop_icon():
+    """Install the requested Spotify artwork into persistent desktop storage."""
+    icons = safe(STATE / 'icons')
+    icons.mkdir(parents=True, exist_ok=True)
+    destination = safe(icons / 'spotify-app.png')
+    source = Path(__file__).resolve().parent / 'assets/spotify-icon.png'
+    if source.is_file() and not source.is_symlink():
+        if digest(source) != SPOTIFY_ICON_SHA256:
+            raise RuntimeError(f'Bundled Spotify icon failed checksum validation: {source}')
+        if not destination.exists() or digest(destination) != SPOTIFY_ICON_SHA256:
+            temporary = destination.with_name('.spotify-app.png.pending')
+            shutil.copy2(source, temporary)
+            temporary.chmod(0o644)
+            os.replace(temporary, destination)
+            print(f'Installed persistent Spotify icon: {destination}', flush=True)
+    if (not destination.is_file() or destination.is_symlink() or
+            digest(destination) != SPOTIFY_ICON_SHA256):
+        raise RuntimeError('Spotify icon asset is unavailable; run install-self or prepare '
+                           'from the reviewed repository checkout')
+    return destination
+
+def spotify_open_helper():
+    return safe(STATE / 'helpers/spotify-xdg-open')
+
+def spotify_snapctl_helper():
+    return safe(STATE / 'helpers/snapctl')
+
+def install_spotify_open_helper():
+    """Install a narrow host-portal bridge for links opened by Spotify."""
+    helper = spotify_open_helper()
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    managed_file(helper,
+                 '''#!/bin/sh
+# Managed by thin-client-setup
+if [ "$#" -ne 1 ]; then
+  echo "spotify-xdg-open: expected exactly one URL" >&2
+  exit 2
+fi
+case "$1" in
+  http://*|https://*) ;;
+  *) echo "spotify-xdg-open: refused non-web URL" >&2; exit 2 ;;
+esac
+if [ -n "${THIN_CLIENT_OPEN_FIFO:-}" ] && [ -p "$THIN_CLIENT_OPEN_FIFO" ]; then
+  printf '%s\n' "$1" > "$THIN_CLIENT_OPEN_FIFO"
+  exit $?
+fi
+echo "spotify-xdg-open: host browser bridge unavailable" >&2
+exit 1
+''', 0o755)
+    return helper
+
+def install_spotify_snapctl_helper():
+    """Provide only the connection checks used by the signed desktop chain."""
+    helper = spotify_snapctl_helper()
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    managed_file(helper,
+                 '''#!/bin/sh
+# Managed by thin-client-setup
+if [ "$#" -eq 2 ] && [ "$1" = "is-connected" ]; then
+  case "$2" in
+    gnome-46-2404|gsettings) exit 0 ;;
+  esac
+fi
+echo "spotify-snapctl: unsupported command" >&2
+exit 1
+''', 0o755)
+    return helper
+
+def spotify_desktop_integration(root, apps=None):
+    """Create the isolated Spotify launcher and register only spotify: links."""
+    apps = apps or HOME / '.local/share/applications'
+    safe(apps).mkdir(parents=True, exist_ok=True)
+    safe(HOME / '.local/bin').mkdir(parents=True, exist_ok=True)
+    icon = spotify_desktop_icon()
+    wrapper = HOME / '.local/bin/spotify'
+    managed_file(wrapper,
+                 '#!/bin/sh\n# Managed by thin-client-setup\n'
+                 f'exec {shlex.quote(str(SELF))} open spotify "$@"\n', 0o755)
+    compatibility_launcher('spotify', wrapper)
+    native_wrapper = HOME / '.local/bin/spotify-native'
+    managed_file(native_wrapper,
+                 '#!/bin/sh\n# Managed by thin-client-setup\n'
+                 f'exec {shlex.quote(str(wrapper))} "$@"\n', 0o755)
+    compatibility_launcher('spotify-native', native_wrapper)
+    managed_file(apps / 'spotify-thin.desktop',
+                 '[Desktop Entry]\n# Managed by thin-client-setup\n'
+                 'Type=Application\nName=Spotify\n'
+                 f'Exec="{wrapper}" %U\nIcon={icon}\n'
+                 'Categories=Audio;Music;Player;AudioVideo;\n'
+                 'StartupWMClass=spotify\nStartupNotify=true\n'
+                 'MimeType=x-scheme-handler/spotify;\n', 0o644)
+    run(['xdg-mime', 'default', 'spotify-thin.desktop',
+         'x-scheme-handler/spotify'], env=xdg_environment())
+
+def install_code_shell():
+    """Remove the school/macOS-style zsh function so `code` uses our wrapper."""
+    body = '''# The school profile defines a macOS `open -b` function on Linux.
+if [ -n "${ZSH_VERSION:-}" ]; then
+  unfunction code 2>/dev/null || true
+  rehash
+fi'''
+    managed_shell_block(HOME / '.zshrc', 'native-code', body)
+
+def desktop_integration(root):
     """Write launchers without installing extensions or requiring apps to quit."""
     apps = HOME / '.local/share/applications'
     safe(apps).mkdir(parents=True, exist_ok=True)
     safe(HOME / '.local/bin').mkdir(parents=True, exist_ok=True)
-    for app, title, command, icon, category in [
-        ('brave', 'Brave (native thin client)', 'brave-native', 'com.brave.Browser', 'Network;WebBrowser;'),
-        ('code', 'VS Code (native thin client)', 'code-native', 'com.visualstudio.code', 'Development;IDE;')]:
+    icons = {app: desktop_icon(root, app) for app in ('brave', 'code')}
+    for app, title, command, category in [
+        ('brave', 'Brave (native thin client)', 'brave-native', 'Network;WebBrowser;'),
+        ('code', 'VS Code (native thin client)', 'code-native', 'Development;IDE;')]:
         wrapper = HOME / '.local/bin' / command
         contents = '#!/bin/sh\n# Managed by thin-client-setup\nexec ' + shlex.quote(str(SELF)) + ' open ' + app + ' "$@"\n'
         managed_file(wrapper, contents, 0o755)
+        compatibility_launcher(command, wrapper)
         entry = apps / (command + '.desktop')
         contents = ('[Desktop Entry]\n# Managed by thin-client-setup\nType=Application\n'
                     f'Name={title}\nExec="{wrapper}" ' + ('%U' if app == 'brave' else '%F') + '\n'
-                    f'Icon={icon}\nCategories={category}\nStartupWMClass=' + ('brave-native' if app == 'brave' else 'code') + '\n')
+                    f'Icon={icons[app]}\nCategories={category}\nStartupWMClass=' + ('brave-native' if app == 'brave' else 'code') + '\n')
         if app == 'brave':
             contents += 'MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;\n'
         managed_file(entry, contents, 0o644)
@@ -550,17 +1893,32 @@ def desktop_integration():
                  '[Desktop Entry]\n# Managed by thin-client-setup\n'
                  'Type=Application\nName=VS Code (native thin client) - URL Handler\n'
                  f'Exec="{wrapper}" --open-url %U\n'
-                 'Icon=com.visualstudio.code\nNoDisplay=true\nStartupNotify=true\n'
+                 f'Icon={icons["code"]}\nNoDisplay=true\nStartupNotify=true\n'
                  'Categories=Development;IDE;\nMimeType=x-scheme-handler/vscode;\n', 0o644)
+    # The root-owned school VS Code cannot be uninstalled without sudo. User
+    # desktop overrides hide it, while `code` becomes an alias-safe managed
+    # wrapper for the native thin-client build.
+    for name in ('code.desktop', 'code-url-handler.desktop'):
+        managed_file(apps / name,
+                     '[Desktop Entry]\n# Managed by thin-client-setup\nHidden=true\n', 0o644)
+    code_wrapper = HOME / '.local/bin/code'
+    managed_file(code_wrapper,
+                 '#!/bin/sh\n# Managed by thin-client-setup\n'
+                 f'exec {shlex.quote(str(SELF))} open code "$@"\n', 0o755)
+    compatibility_launcher('code', code_wrapper)
+    install_code_shell()
+    spotify_desktop_integration(root, apps)
     if shutil.which('update-desktop-database'):
         run(['update-desktop-database', apps], env=xdg_environment())
     run(['xdg-mime', 'default', 'code-native-url-handler.desktop', 'x-scheme-handler/vscode'],
         env=xdg_environment())
-    print('Launchers installed; vscode URI handler registered; browser default and shell configuration unchanged', flush=True)
+    print('Launchers installed; system VS Code hidden for this user; Code and Spotify URI '
+          'handlers registered; browser default unchanged', flush=True)
 
 def managed_file(path, contents, mode):
     safe(path)
-    if path.exists() and '# Managed by thin-client-setup' not in path.read_text().splitlines():
+    if (path.exists() and not any('# Managed by thin-client-setup' in line
+                                  for line in path.read_text().splitlines())):
         raise RuntimeError(f'Refusing to overwrite unmanaged file: {path}')
     if not path.exists() or path.read_text() != contents:
         fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
@@ -572,23 +1930,339 @@ def managed_file(path, contents, mode):
     elif stat.S_IMODE(path.stat().st_mode) != mode:
         path.chmod(mode)
 
+def spotify_xauthority():
+    """Return the current user's X11 cookie without exposing arbitrary files."""
+    raw = os.environ.get('XAUTHORITY') or str(HOME / '.Xauthority')
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+        details = resolved.stat()
+    except OSError:
+        return None
+    runtime = Path('/run/user') / str(os.getuid())
+    if (not resolved.is_file() or details.st_uid != os.getuid() or
+            not (resolved.is_relative_to(HOME.resolve()) or
+                 resolved.is_relative_to(runtime))):
+        return None
+    return resolved
+
+def spotify_browser_url(value):
+    """Validate one URL received from the sandbox before opening it on the host."""
+    if not isinstance(value, str) or not value or len(value) > 8192 or '\n' in value or '\r' in value:
+        return None
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return None
+    return value
+
+def start_spotify_browser_bridge():
+    """Fork a private host-side xdg-open relay that lives with Spotify's parent."""
+    runtime = Path('/run/user') / str(os.getuid())
+    configured = Path(os.environ.get('XDG_RUNTIME_DIR', str(runtime)))
+    if configured.resolve() != runtime or not runtime.is_dir() or runtime.stat().st_uid != os.getuid():
+        raise RuntimeError('Spotify browser bridge needs the account XDG runtime directory')
+    directory = Path(tempfile.mkdtemp(prefix='thin-client-spotify-', dir=runtime))
+    directory.chmod(0o700)
+    fifo = directory / 'open.fifo'
+    os.mkfifo(fifo, 0o600)
+    parent = os.getpid()
+    try:
+        child = os.fork()
+    except OSError:
+        fifo.unlink(missing_ok=True)
+        directory.rmdir()
+        raise
+    if child:
+        return fifo
+    # This child remains in the host mount namespace. The parent keeps its PID
+    # when it execs bwrap, so getppid() changes only when Spotify really exits.
+    try:
+        descriptor = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        buffered = b''
+        while os.getppid() == parent:
+            readable, _, _ = select.select([descriptor], [], [], 1.0)
+            if not readable:
+                continue
+            chunk = os.read(descriptor, 16384)
+            if not chunk:
+                continue
+            buffered += chunk
+            while b'\n' in buffered:
+                line, buffered = buffered.split(b'\n', 1)
+                try:
+                    url = spotify_browser_url(line.decode('utf-8', errors='strict'))
+                except UnicodeDecodeError:
+                    url = None
+                if url:
+                    brave = HOME / '.local/bin/brave-native'
+                    managed_brave = (brave.is_file() and not brave.is_symlink() and
+                                     os.access(brave, os.X_OK) and
+                                     '# Managed by thin-client-setup' in brave.read_text())
+                    command = [str(brave), url] if managed_brave else ['/usr/bin/xdg-open', url]
+                    subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     close_fds=True, start_new_session=True)
+        os.close(descriptor)
+    except BaseException:
+        pass
+    finally:
+        fifo.unlink(missing_ok=True)
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+        os._exit(0)
+
+def spotify_environment(root, release, metadata):
+    """Recreate the user-visible Snap environment inside the portable runtime."""
+    env = environment(root, 'spotify')
+    snap_data = SPOTIFY / 'system' / metadata['revision']
+    snap_common = SPOTIFY / 'system/common'
+    for directory in (SPOTIFY / '.config', SPOTIFY / '.local/share', SPOTIFY / 'common',
+                      SPOTIFY / 'common/.cache', SPOTIFY / '.cache', SPOTIFY / '.tmp',
+                      snap_data, snap_common):
+        safe(directory).mkdir(parents=True, exist_ok=True)
+    snap = '/snap/spotify/current'
+    session_runtime = f'/run/user/{os.getuid()}'
+    snap_runtime = f'{session_runtime}/snap.spotify'
+    env.update({
+        'HOME': str(SPOTIFY), 'SNAP': snap, 'SNAP_NAME': 'spotify',
+        'SNAP_INSTANCE_NAME': 'spotify', 'SNAP_ARCH': 'amd64',
+        'SNAP_VERSION': metadata['version'], 'SNAP_REVISION': metadata['revision'],
+        'SNAP_DATA': str(snap_data), 'SNAP_COMMON': str(snap_common),
+        'SNAP_USER_DATA': str(SPOTIFY), 'SNAP_USER_COMMON': str(SPOTIFY / 'common'),
+        'SNAP_REAL_HOME': str(HOME), 'XDG_CONFIG_HOME': str(SPOTIFY / '.config'),
+        'XDG_DATA_HOME': str(SPOTIFY / '.local/share'),
+        'XDG_CACHE_HOME': str(SPOTIFY / '.cache'), 'TMPDIR': str(SPOTIFY / '.tmp'),
+        'SNAP_UID': str(os.getuid()), 'SNAP_EUID': str(os.geteuid()),
+        'SNAP_DESKTOP_RUNTIME': f'{snap}/gnome-platform', 'GTK_USE_PORTAL': '1',
+        # The official desktop-launch helper deliberately searches the parent
+        # of this snap-specific directory for Wayland and PulseAudio sockets.
+        'XDG_RUNTIME_DIR': snap_runtime,
+        'PIPEWIRE_RUNTIME_DIR': session_runtime,
+        'PULSE_SERVER': f'unix:{session_runtime}/pulse/native',
+        # Some school images provide internet outside NetworkManager while its
+        # system-bus state remains DISCONNECTED. Spotify trusts that false
+        # signal over successful HTTPS/AP connections and forces all private
+        # library and playback requests offline. Keep the session bus (MPRIS,
+        # desktop integration) but hide only the incorrect system-bus signal;
+        # Spotify then uses its built-in Ethernet connectivity fallback.
+        'DBUS_SYSTEM_BUS_ADDRESS': f'unix:path={snap_runtime}/no-system-bus',
+        'FONTCONFIG_PATH': f'{snap}/gnome-platform/etc/fonts',
+        'FONTCONFIG_FILE': 'fonts.conf',
+        'PATH': f'/usr/lib/snapd:{snap}/usr/sbin:{snap}/usr/bin:'
+                f'{snap}/sbin:{snap}/bin:/usr/bin:/bin',
+        # snapd normally seeds provider paths before invoking command-chain
+        # helpers. We launch without snapd, so provide their signed in-container
+        # locations explicitly; the helpers may safely append further subdirs.
+        'LD_LIBRARY_PATH': ':'.join((
+            f'{snap}/usr/lib/x86_64-linux-gnu', f'{snap}/usr/lib',
+            f'{snap}/gnome-platform/lib/x86_64-linux-gnu',
+            f'{snap}/gnome-platform/usr/lib/x86_64-linux-gnu',
+            f'{snap}/gnome-platform/usr/lib/x86_64-linux-gnu/libproxy',
+            f'{snap}/gnome-platform/usr/lib',
+            f'{snap}/gpu-2404/usr/lib/x86_64-linux-gnu',
+            f'{snap}/gpu-2404/usr/lib/x86_64-linux-gnu/dri',
+        )),
+    })
+    if spotify_xauthority():
+        env['XAUTHORITY'] = str(HOME / '.thin-client-Xauthority')
+    else:
+        env.pop('XAUTHORITY', None)
+    return env
+
+def spotify_audio_api(runtime=None):
+    """Choose the usable host audio service, preferring the stable Pulse API."""
+    runtime = runtime or Path('/run/user') / str(os.getuid())
+    sockets = (('pulseaudio', runtime / 'pulse/native'),
+               ('pipewire', runtime / 'pipewire-0'))
+    for backend, path in sockets:
+        try:
+            if stat.S_ISSOCK(path.stat().st_mode):
+                return backend
+        except OSError:
+            continue
+    # PulseAudio is also the least surprising default on older school images;
+    # Spotify will report a clear player error if no audio session exists.
+    return 'pulseaudio'
+
+def spotify_container_argv(root, release, metadata, app_args):
+    """Build a no-root bubblewrap launch using the managed core24 filesystem."""
+    if not BWRAP.is_file() or not os.access(BWRAP, os.X_OK):
+        raise RuntimeError('Spotify needs /usr/bin/bwrap for its no-sudo core24 runtime')
+    core = snap_runtime_release(root, 'core24')[0]
+    gnome = snap_runtime_release(root, 'gnome-46-2404')[0]
+    mesa = snap_runtime_release(root, 'mesa-2404')[0]
+    themes = snap_runtime_release(root, 'gtk-common-themes')[0]
+    layouts = spotify_layout_mounts(core, gnome, mesa)
+    open_helper = spotify_open_helper()
+    if (not open_helper.is_file() or open_helper.is_symlink() or
+            not os.access(open_helper, os.X_OK)):
+        raise RuntimeError('Spotify browser bridge is missing: run '
+                           'thin-client-setup install-self')
+    snapctl_helper = spotify_snapctl_helper()
+    if (not snapctl_helper.is_file() or snapctl_helper.is_symlink() or
+            not os.access(snapctl_helper, os.X_OK)):
+        raise RuntimeError('Spotify Snap compatibility helper is missing: run '
+                           'thin-client-setup install-self')
+    ensure_spotify_mountpoints(release)
+    # Validate every executable against the signed Spotify extraction before
+    # translating it to the stable in-container mount path.
+    spotify_launch(root, release, metadata)
+    inside_snap = Path('/snap/spotify/current')
+    command = [str(inside_snap / item) for item in metadata['command_chain']]
+    command.append(str(inside_snap / metadata['command'][0]))
+    command.extend(metadata['command'][1:])
+    caches = safe(runtime_storage(root) / 'cache/spotify')
+    temporary = safe(runtime_storage(root) / 'tmp/spotify')
+    for directory in (caches, temporary, SPOTIFY / '.cache',
+                      SPOTIFY / 'common/.cache', SPOTIFY / '.tmp'):
+        directory.mkdir(parents=True, exist_ok=True)
+    argv = [
+        str(BWRAP), '--die-with-parent', '--ro-bind', str(core), '/',
+        '--dev-bind', '/dev', '/dev', '--proc', '/proc', '--ro-bind', '/sys', '/sys',
+        '--bind', '/run', '/run', '--tmpfs', '/home', '--dir', str(HOME),
+        '--bind', str(SPOTIFY), str(SPOTIFY),
+        '--bind', str(caches), str(SPOTIFY / '.cache'),
+        '--bind', str(caches), str(SPOTIFY / 'common/.cache'),
+        '--bind', str(temporary), str(SPOTIFY / '.tmp'),
+        '--tmpfs', '/snap', '--dir', '/snap/spotify',
+        '--ro-bind', str(release), str(inside_snap),
+        '--ro-bind', str(gnome), str(inside_snap / 'gnome-platform'),
+        '--ro-bind', str(mesa), str(inside_snap / 'gpu-2404'),
+        '--ro-bind', str(open_helper), '/usr/bin/xdg-open',
+        # core24 reserves this empty directory for snapd helpers. Binding our
+        # reviewed helper directory avoids trying to create a file beneath the
+        # read-only /usr tree.
+        '--ro-bind', str(snapctl_helper.parent), '/usr/lib/snapd',
+    ]
+    # These bindings come from the official snap.yaml layouts. Without them,
+    # the unpacked client can start but WebKit/API views and GPU configuration
+    # are incomplete, which presents as empty profiles and unloaded playlists.
+    for source, target in layouts:
+        argv.extend(['--ro-bind', str(source), '/' + str(target.relative_to(core))])
+    xauthority = spotify_xauthority()
+    if xauthority:
+        argv.extend(['--ro-bind', str(xauthority),
+                     str(HOME / '.thin-client-Xauthority')])
+    # The runtime provides Fontconfig itself, while the post provides the
+    # installed font files. Keep both system font trees read-only.
+    for font_directory in ('/usr/share/fonts', '/usr/local/share/fonts'):
+        source = Path(font_directory)
+        target = core / font_directory.lstrip('/')
+        if source.is_dir() and target.is_dir():
+            argv.extend(['--ro-bind', font_directory, font_directory])
+    for subdirectory in ('themes', 'icons', 'sounds'):
+        source = themes / 'share' / subdirectory
+        if source.is_dir():
+            argv.extend(['--ro-bind', str(source),
+                         str(inside_snap / 'data-dir' / subdirectory)])
+    # Share the host's live desktop/audio session and identity files while all
+    # executable and library files continue to come from the signed runtime.
+    for path in ('/etc/resolv.conf', '/etc/hosts', '/etc/machine-id',
+                 '/etc/nsswitch.conf', '/etc/passwd', '/etc/group'):
+        if Path(path).is_file():
+            argv.extend(['--ro-bind-try', path, path])
+    argv.extend(['--chdir', str(SPOTIFY), '--', *command, *app_args])
+    return BWRAP, argv
+
 def open_app(root, app, args):
-    if any(a.startswith(('--user-data-dir', '--extensions-dir', '--disk-cache-dir', '--disk-cache-size')) for a in args):
+    if any(a.startswith(('--user-data-dir', '--extensions-dir', '--disk-cache-dir',
+                         '--disk-cache-size', '--disable-gpu', '--app=', '--class='))
+           for a in args):
         raise RuntimeError('Storage overrides belong in the reviewed setup, not launcher arguments')
-    exe = root / ('apps/brave/current/brave' if app == 'brave' else 'apps/vscode/current/bin/code')
+    if app == 'code':
+        exe = root / 'apps/vscode/current/bin/code'
+    elif app == 'brave':
+        exe = root / 'apps/brave/current/brave'
+    else:
+        release, metadata = spotify_release(root)
+        exe, spotify_argv = spotify_launch(root, release, metadata)
     if not os.access(exe, os.X_OK):
         raise RuntimeError('Goinfre app missing: run ~/.local/bin/thin-client-setup prepare explicitly')
-    profile = BRAVE if app == 'brave' else CODE
+    profiles = {'brave': BRAVE, 'code': CODE, 'spotify': SPOTIFY}
+    profile = profiles[app]
     if not (profile / '.thin-client-import').exists():
         raise RuntimeError('Profile not prepared: run thin-client-setup migrate/integrate')
     safe(profile)
-    (brave_caches if app == 'brave' else vscode_caches)(root)
-    env = environment(root, app if app == 'brave' else 'vscode')
     if app == 'brave':
-        argv = [exe, f'--user-data-dir={BRAVE}', '--class=brave-native', '--disk-cache-size=104857600', *args]
+        brave_caches(root)
+    elif app == 'code':
+        vscode_caches(root)
     else:
-        argv = [*code_args(root), *args]
+        spotify_caches(root)
+    env = (spotify_environment(root, release, metadata) if app == 'spotify' else
+           environment(root, 'vscode' if app == 'code' else app))
+    acceleration = gpu_args()
+    if not acceleration:
+        print('GPU acceleration unavailable on this post: no usable /dev/dri render node; '
+              'using the application software renderer.', file=sys.stderr, flush=True)
+    if app == 'brave':
+        argv = [exe, f'--user-data-dir={BRAVE}', '--class=brave-native',
+                '--disk-cache-size=104857600', *acceleration, *args]
+    elif app == 'code':
+        argv = [*code_args(root), *acceleration, *args]
+    else:
+        spotify_args = [*acceleration, *args]
+        if not any(value == '--audio-api' or value.startswith('--audio-api=')
+                   for value in spotify_args):
+            # Recent official Linux builds can select a non-working PipeWire
+            # path outside snapd. The host Pulse socket is stable across the
+            # supported school images and is already shared into the sandbox.
+            spotify_args.insert(0, f'--audio-api={spotify_audio_api()}')
+        # Detailed logs are intentionally opt-in: level 8 grows quickly during
+        # normal listening. The fixed path remains disposable and makes a
+        # future diagnosis reproducible with THIN_CLIENT_SPOTIFY_DEBUG=1.
+        if os.environ.get('THIN_CLIENT_SPOTIFY_DEBUG') == '1':
+            if not any(value == '--log-file' or value.startswith('--log-file=')
+                       for value in spotify_args):
+                spotify_args.insert(0,
+                                    f'--log-file={SPOTIFY / ".tmp/spotify-client.log"}')
+            if not any(value == '--debug-level' or value.startswith('--debug-level=')
+                       for value in spotify_args):
+                spotify_args.insert(0, '--debug-level=8')
+        exe, argv = spotify_container_argv(root, release, metadata, spotify_args)
+        env['THIN_CLIENT_OPEN_FIFO'] = str(start_spotify_browser_bridge())
     os.execve(exe, [str(a) for a in argv], env)
+
+def open_cli(root, name, args):
+    locations = {'codex': root / 'apps/codex/bin/codex',
+                 'claude': root / 'apps/claude/current/claude'}
+    exe = locations[name]
+    try:
+        confined_executable(exe, root / 'apps' / name)
+    except RuntimeError:
+        raise RuntimeError(f'Goinfre {name} missing: run '
+                           f'~/.local/bin/thin-client-setup {name} prepare explicitly')
+    env = dict(os.environ)
+    temporary = safe(runtime_storage(root) / 'tmp' / name)
+    temporary.mkdir(parents=True, exist_ok=True)
+    env['TMPDIR'] = str(temporary)
+    if name == 'codex':
+        state = safe(HOME / '.codex')
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        packages = state / 'packages'
+        expected_packages = root / 'apps/codex/installer-home/packages'
+        if not packages.is_symlink() or packages.resolve() != expected_packages.resolve():
+            raise RuntimeError('Codex packages are still in HOME or point elsewhere: quit Codex, '
+                               'then run thin-client-setup codex prepare')
+        env['CODEX_HOME'] = str(state)
+        env.pop('CODEX_INSTALL_DIR', None)
+        daemon = packages / 'app-server-daemon/current/bin/codex'
+        if not os.access(daemon, os.X_OK) and '--no-daemon' not in args:
+            print('Codex daemon package is unavailable on this post; starting in supported '
+                  '--no-daemon mode. Repair it later from a writable goinfre post.',
+                  file=sys.stderr, flush=True)
+            args = ['--no-daemon', *args]
+    else:
+        state = safe(HOME / '.claude')
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        env['CLAUDE_CONFIG_DIR'] = str(state)
+        env['CLAUDE_CODE_TMPDIR'] = str(temporary)
+        env['DISABLE_UPDATES'] = '1'
+    os.execve(exe, [str(exe), *args], env)
 
 def allocated(path):
     if not path.exists():
@@ -601,11 +2275,12 @@ def audit():
     run(['df', '-h', HOME])
     for path in [HOME / '.local', HOME / '.var', HOME / '.config',
                  OLD_BRAVE.parent.parent.parent, OLD_CODE.parent.parent.parent,
-                 BRAVE, CODE]:
+                 BRAVE, CODE, SPOTIFY]:
         print(f'{path}: {allocated(path)} allocated bytes', flush=True)
     try:
-        root = goinfre()
-        print(f'Validated disposable storage: {root.parent}', flush=True)
+        root = goinfre(require_writable=False)
+        mode = 'writable' if os.access(root, os.W_OK | os.X_OK) else 'read-only'
+        print(f'Validated disposable storage: {root.parent} ({mode})', flush=True)
         run(['df', '-h', root.parent])
     except RuntimeError as error:
         print(f'Goinfre unavailable: {error}', flush=True)
@@ -616,22 +2291,37 @@ def audit():
 def doctor():
     script_status()
     audit()
-    tools = ['python3', 'curl', 'rsync', 'ps', 'du', 'df', 'xdg-mime', 'xdg-settings']
+    tools = ['python3', 'curl', 'gpg', 'rsync', 'ps', 'du', 'df', 'xdg-mime',
+             'xdg-settings', 'snap', 'unsquashfs', 'bwrap', 'gcc', 'make']
     for tool in tools:
         print(f'{tool}: {shutil.which(tool) or "MISSING"}', flush=True)
-    print('GPU device nodes: ' + ('present' if Path('/dev/dri').is_dir() else 'not visible'), flush=True)
+    print('GPU acceleration: ' + ('usable DRM render node' if gpu_render_available()
+                                  else 'unavailable (no usable DRM render node)'), flush=True)
     print('Manual checks: brave://version, brave://gpu, WebGL/WebGL2 and your apps; '
-          'Code Remote SSH and GitHub sign-in. See README.', flush=True)
+          'Spotify playback; Code Remote SSH and GitHub sign-in. See README.', flush=True)
 
 def install_self():
     source = Path(__file__).resolve()
     safe(SELF)
     if source == SELF.resolve():
+        install_spotify_open_helper()
+        install_spotify_snapctl_helper()
         return
     safe(SELF.parent).mkdir(parents=True, exist_ok=True)
     managed_file(SELF, source.read_text(), 0o755)
     if digest(source) != digest(SELF):
         raise RuntimeError('Installed script differs after update; inspect before proceeding')
+    compatibility_launcher('thin-client-setup', SELF)
+    install_spotify_open_helper()
+    install_spotify_snapctl_helper()
+    # Upgrade existing managed launchers even when this post's goinfre is
+    # read-only and therefore cannot run a full prepare/install operation.
+    for name in ('brave-native', 'code-native', 'code', 'spotify', 'spotify-native',
+                 'codex', 'claude'):
+        launcher = HOME / '.local/bin' / name
+        if (launcher.is_file() and not launcher.is_symlink() and
+                '# Managed by thin-client-setup' in launcher.read_text()):
+            compatibility_launcher(name, launcher)
     print(f'Installed setup {VERSION}: {SELF}; SHA-256 {digest(SELF)}', flush=True)
 
 def script_status():
@@ -665,9 +2355,15 @@ def desktop_diagnostics():
     """Report actual defaults against the explicit native deployment choice."""
     checks = [('default web browser', ['xdg-settings', 'get', 'default-web-browser'],
                'brave-native.desktop')]
-    checks += [(f'{scheme} handler', ['xdg-mime', 'query', 'default', f'x-scheme-handler/{scheme}'],
-                'code-native-url-handler.desktop' if scheme == 'vscode' else 'brave-native.desktop')
-               for scheme in ['http', 'https', 'vscode']]
+    handlers = {
+        'http': 'brave-native.desktop',
+        'https': 'brave-native.desktop',
+        'vscode': 'code-native-url-handler.desktop',
+        'spotify': 'spotify-thin.desktop',
+    }
+    checks += [(f'{scheme} handler',
+                ['xdg-mime', 'query', 'default', f'x-scheme-handler/{scheme}'], expected)
+               for scheme, expected in handlers.items()]
     ok = True
     for label, command, expected in checks:
         try:
@@ -679,7 +2375,8 @@ def desktop_diagnostics():
         print(f'{label}: {value}; expected {expected}; {"OK" if match else "MISMATCH"}', flush=True)
         ok = ok and match
     apps = HOME / '.local/share/applications'
-    for name in ['brave-native.desktop', 'code-native.desktop', 'code-native-url-handler.desktop']:
+    for name in ['brave-native.desktop', 'code-native.desktop',
+                 'code-native-url-handler.desktop', 'spotify-thin.desktop']:
         present = (apps / name).is_file()
         print(f'Expected desktop entry: {apps / name}; {"present" if present else "MISSING"}', flush=True)
         ok = ok and present
@@ -705,20 +2402,73 @@ def make_default_browser():
         raise RuntimeError('Desktop defaults did not match after registration; see diagnostics above')
     print('Explicit choice applied: native Brave is the HTTP/HTTPS default', flush=True)
 
-def codex_status(root):
-    """Metadata only. Do not execute Codex, read credentials, or migrate state."""
-    codex_home = Path(os.environ.get('CODEX_HOME', str(HOME / '.codex')))
-    print(f'Codex command: {shutil.which("codex") or "not on PATH"}', flush=True)
-    print(f'Codex state root: {codex_home}', flush=True)
-    for name, kind in [('config.toml', 'configuration'), ('auth.json', 'file credentials (optional)'),
-                       ('sessions', 'session state'), ('history.jsonl', 'history'),
-                       ('packages', 'managed executable packages'), ('plugins', 'plugin resources/state'),
-                       ('skills', 'skills')]:
-        print(f'{name}: {"present" if (codex_home / name).exists() else "absent"}; {kind}', flush=True)
-    print('Codex split installation is not implemented: CODEX_HOME selects the entire state root; '
-          'CODEX_INSTALL_DIR changes only the visible command location, not the standalone package cache. '
-          f'A wholly disposable state root could be {root / "codex-home"}, but auth, sessions, '
-          'config and skills there would also be lost on a new post. See README.', flush=True)
+def cli_status(root, name):
+    """Report metadata only; never execute a CLI or read credentials/settings."""
+    if name == 'codex':
+        state = HOME / '.codex'
+        executable = root / 'apps/codex/bin/codex'
+        known = [('config.toml', 'configuration'), ('auth.json', 'file credentials (optional)'),
+                 ('sessions', 'session state'), ('history.jsonl', 'history'),
+                 ('plugins', 'plugin resources/state'), ('skills', 'skills')]
+    else:
+        state = HOME / '.claude'
+        executable = root / 'apps/claude/current/claude'
+        known = [('settings.json', 'configuration'), ('projects', 'project/session state'),
+                 ('plugins', 'plugin resources/state'), ('skills', 'skills')]
+    wrapper = HOME / '.local/bin' / name
+    print(f'{name} launcher: {wrapper}; {"present" if wrapper.exists() else "missing"}', flush=True)
+    print(f'{name} goinfre executable: {executable}; '
+          f'{"present" if os.access(executable, os.X_OK) else "missing"}', flush=True)
+    print(f'{name} persistent state root: {state}', flush=True)
+    if name == 'codex':
+        packages = state / 'packages'
+        expected = root / 'apps/codex/installer-home/packages'
+        linked = packages.is_symlink() and packages.resolve() == expected.resolve()
+        print(f'packages: {packages}; {"goinfre link OK" if linked else "HOME/incorrect link"}',
+              flush=True)
+    for child, kind in known:
+        print(f'{child}: {"present" if (state / child).exists() else "absent"}; {kind}', flush=True)
+    if name == 'claude':
+        print(f'.claude.json: {"present" if (HOME / ".claude.json").exists() else "absent"}; '
+              'persistent account/project metadata', flush=True)
+
+def pyenv_status(root):
+    appdir = root / 'apps/pyenv'
+    executable = appdir / 'bin/pyenv'
+    managed = os.access(executable, os.X_OK)
+    fallback = Path('/opt/pyenv/bin/pyenv')
+    print(f'pyenv managed executable: {executable}; {"present" if managed else "missing"}',
+          flush=True)
+    print(f'pyenv school fallback: {fallback}; '
+          f'{"present" if os.access(fallback, os.X_OK) else "missing"}', flush=True)
+    print(f'pyenv Python versions: {appdir / "versions"}', flush=True)
+    for path in (HOME / '.zshrc', HOME / '.bashrc'):
+        configured = (path.is_file() and '# >>> thin-client pyenv >>>' in path.read_text())
+        print(f'{path}: {"managed block present" if configured else "managed block missing"}',
+              flush=True)
+
+def spotify_status(root):
+    try:
+        release, metadata = spotify_release(root)
+        release_state = (f'official {metadata["version"]} snap revision '
+                         f'{metadata["revision"]} ({release})')
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        release_state = f'missing or invalid ({error})'
+    print(f'Spotify official client: {release_state}', flush=True)
+    for name in SPOTIFY_RUNTIME_SNAP_IDS:
+        try:
+            runtime, runtime_metadata = snap_runtime_release(root, name)
+            state = f'{runtime_metadata["version"]} ({runtime})'
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+            state = f'missing or invalid ({error})'
+        print(f'Spotify runtime {name}: {state}', flush=True)
+    print(f'Spotify persistent profile: {SPOTIFY}; '
+          f'{"prepared" if (SPOTIFY / ".thin-client-import").is_file() else "missing"}',
+          flush=True)
+    for launcher in (HOME / '.local/bin/spotify', HOME / '.local/bin/spotify-native'):
+        print(f'Spotify launcher: {launcher}; '
+              f'{"present" if launcher.is_file() else "missing"}', flush=True)
+    print(f'Spotify disposable cache: {root / "cache/spotify"}', flush=True)
 
 def flatpak_path(app):
     if app not in APP_IDS:
@@ -806,10 +2556,11 @@ def retire_flatpak(root, app, *, dry_run=False, verified=False, yes=False, backu
     shutil.rmtree(path)
 
 def cli_parser():
-    parser = argparse.ArgumentParser(description='Native Brave + VS Code thin client; no HOME binary fallback')
+    parser = argparse.ArgumentParser(
+        description='Brave, VS Code, Spotify, Codex and Claude thin client; no HOME binary fallback')
     parser.add_argument('--version', action='version', version=f'thin-client-setup {VERSION}')
     subs = parser.add_subparsers(dest='command', required=True)
-    for command in ['audit', 'doctor', 'status', 'install-self', 'install', 'migrate', 'integrate', 'desktop', 'prepare', 'browser-default']:
+    for command in ['audit', 'doctor', 'status', 'install-self', 'install', 'migrate', 'integrate', 'desktop', 'prepare', 'theme', 'browser-default']:
         sub = subs.add_parser(command)
         sub.add_argument('--dry-run', action='store_true')
         if command in ['integrate', 'prepare']:
@@ -817,11 +2568,18 @@ def cli_parser():
     sub = subs.add_parser('defaults', help='Explicitly register the native browser and Code callback')
     sub.add_argument('browser', choices=['brave'])
     sub.add_argument('--dry-run', action='store_true')
-    sub = subs.add_parser('codex', help='Inspect Codex storage; safe persistent/package split is deferred')
-    sub.add_argument('action', choices=['status', 'install', 'prepare'])
+    for name in ['codex', 'claude']:
+        sub = subs.add_parser(name, help=f'Install or inspect {name} with persistent HOME state')
+        sub.add_argument('action', choices=['status', 'install', 'prepare'])
+        sub.add_argument('--dry-run', action='store_true')
+    sub = subs.add_parser('spotify', help='Install or inspect the official Spotify client')
+    sub.add_argument('action', choices=['status', 'install', 'prepare', 'repair-login'])
+    sub.add_argument('--dry-run', action='store_true')
+    sub = subs.add_parser('pyenv', help='Install or integrate pyenv without sudo')
+    sub.add_argument('action', choices=['status', 'integrate', 'install', 'prepare'])
     sub.add_argument('--dry-run', action='store_true')
     sub = subs.add_parser('open')
-    sub.add_argument('app', choices=['brave', 'code'])
+    sub.add_argument('app', choices=['brave', 'code', 'spotify', 'codex', 'claude'])
     sub.add_argument('args', nargs=argparse.REMAINDER)
     sub = subs.add_parser('retire-flatpak')
     sub.add_argument('app', choices=sorted(APP_IDS))
@@ -849,22 +2607,50 @@ def main(argv=None):
     if command == 'status':
         script_status()
         desktop_diagnostics()
-    if command == 'codex' and options.action != 'status':
-        raise RuntimeError('Codex install/prepare is deferred: no supported independent heavy-package '
-                           'root was established for persistent CODEX_HOME. No files changed. '
-                           'See README for supported alternatives; codex status is read-only.')
-    root = goinfre()
-    print(f'Goinfre: {root}\nBrave persistent profile: {BRAVE}\nVS Code persistent state: {CODE}', flush=True)
+    mutates_goinfre = (command in ['install', 'migrate', 'integrate', 'prepare',
+                                   'retire-flatpak'] or
+                       (command in ['codex', 'claude'] and options.action != 'status') or
+                       (command == 'spotify' and options.action != 'status') or
+                       (command == 'pyenv' and options.action in ['install', 'prepare']))
+    root = goinfre(require_writable=mutates_goinfre and
+                   not getattr(options, 'dry_run', False))
+    storage_mode = ('writable' if os.access(root, os.W_OK | os.X_OK)
+                    else f'read-only; runtime cache: {transient_runtime_path()}')
+    print(f'Goinfre: {root}\nBrave persistent profile: {BRAVE}\nVS Code persistent state: {CODE}'
+          f'\nSpotify persistent profile: {SPOTIFY}'
+          f'\nCodex persistent state: {HOME / ".codex"}'
+          f'\nClaude persistent state: {HOME / ".claude"}'
+          f'\nGoinfre mode: {storage_mode}', flush=True)
     if command == 'status':
-        for p in [root / 'apps/brave/current', root / 'apps/vscode/current', BRAVE, CODE, root / 'vscode-extensions']:
+        for p in [root / 'apps/brave/current', root / 'apps/vscode/current',
+                  root / 'apps/spotify/current',
+                  root / 'apps/codex/bin/codex', root / 'apps/claude/current/claude',
+                  root / 'apps/pyenv/bin/pyenv',
+                  BRAVE, CODE, SPOTIFY, HOME / '.codex', HOME / '.claude',
+                  vscode_extensions()]:
             print(p, 'present' if p.exists() else 'missing')
-        if not all(os.access(root / exe, os.X_OK) for exe in
-                   ['apps/brave/current/brave', 'apps/vscode/current/bin/code']):
+        core_ready = all(os.access(root / exe, os.X_OK) for exe in
+                         ['apps/brave/current/brave', 'apps/vscode/current/bin/code',
+                          'apps/codex/bin/codex', 'apps/claude/current/claude'])
+        try:
+            spotify_release(root)
+            spotify_ready = (SPOTIFY / '.thin-client-import').is_file()
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+            spotify_ready = False
+        pyenv_ready = (os.access(root / 'apps/pyenv/bin/pyenv', os.X_OK) or
+                       os.access('/opt/pyenv/bin/pyenv', os.X_OK))
+        if not core_ready or not spotify_ready or not pyenv_ready:
             print('New/unprepared workstation detected. Run: ~/.local/bin/thin-client-setup prepare '
                   '(after quitting applications). No downloads were started.', flush=True)
         return
-    if command == 'codex':
-        codex_status(root)
+    if command in ['codex', 'claude'] and options.action == 'status':
+        cli_status(root, command)
+        return
+    if command == 'spotify' and options.action == 'status':
+        spotify_status(root)
+        return
+    if command == 'pyenv' and options.action == 'status':
+        pyenv_status(root)
         return
     if getattr(options, 'dry_run', False):
         if command == 'retire-flatpak':
@@ -873,23 +2659,52 @@ def main(argv=None):
             print(f'DRY RUN: {command}; no files, locks, downloads or handlers changed')
         return
     if command == 'open':
-        open_app(root, options.app, options.args)
+        if options.app in ['codex', 'claude']:
+            open_cli(root, options.app, options.args)
+        else:
+            open_app(root, options.app, options.args)
         return
     os.umask(0o077)
     safe(STATE).mkdir(parents=True, exist_ok=True)
     with (STATE / 'setup.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        safe(root).mkdir(parents=True, exist_ok=True)
-        if command in ['install', 'integrate', 'desktop', 'prepare', 'defaults']:
+        if mutates_goinfre:
+            safe(root).mkdir(parents=True, exist_ok=True)
+        if command in ['install', 'integrate', 'desktop', 'prepare', 'theme', 'defaults',
+                       'codex', 'claude', 'spotify', 'pyenv']:
             install_self()
+        if command in ['codex', 'claude']:
+            install_coding_clis(root, only=command)
+        if command == 'pyenv':
+            if options.action == 'integrate':
+                install_pyenv_shell(root)
+            else:
+                safe(root / 'tmp').mkdir(parents=True, exist_ok=True)
+                work = Path(tempfile.mkdtemp(prefix='pyenv-download-', dir=root / 'tmp'))
+                print(f'pyenv download staging (retained on success/failure): {work}', flush=True)
+                install_pyenv(root, work)
+        if command == 'spotify':
+            if options.action == 'repair-login':
+                repair_spotify_login(root)
+            else:
+                install_spotify(root)
+            if options.action == 'prepare':
+                migrate_spotify()
+                spotify_caches(root)
+                spotify_desktop_integration(root)
+                if shutil.which('update-desktop-database'):
+                    run(['update-desktop-database', HOME / '.local/share/applications'],
+                        env=xdg_environment())
         if command in ['install', 'prepare']:
             install(root)
         if command in ['migrate', 'prepare']:
             migrate(root)
         if command in ['integrate', 'prepare']:
             integrate(root)
+        if command == 'theme':
+            install_vscode_theme(root)
         if command in ['desktop', 'defaults']:
-            desktop_integration()
+            desktop_integration(root)
         if command in ['browser-default', 'defaults'] or getattr(options, 'make_default_browser', False):
             make_default_browser()
         if command == 'retire-flatpak':

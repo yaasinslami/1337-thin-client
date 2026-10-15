@@ -1,7 +1,7 @@
 # 1337 Thin Client
 
-Native Brave and VS Code for a Linux 42/1337 workstation with a small HOME
-filesystem. Keep reproducible applications and caches in **goinfre** while
+Native Brave, VS Code, the official Spotify client, Codex CLI, Claude Code and pyenv for a Linux 42/1337 workstation
+with a small HOME filesystem. Keep reproducible applications and caches in **goinfre** while
 preserving personal browser data and editor preferences in **HOME**.
 
 Inspired by [shank187/session-setup](https://github.com/shank187/session-setup).
@@ -16,17 +16,26 @@ browser can use the host graphics stack instead. This is a compatibility approac
 not a guarantee of hardware acceleration: verify your actual renderer.
 
 ```text
-HOME                              GOINFRE (disposable)
-  SSH keys/config (untouched)        thin-client/apps/{brave,vscode}/releases/
-  shell/Git config (untouched)       thin-client/apps/*/current
-  .config/BraveSoftware/             thin-client/cache/
-    Brave-Browser/                  thin-client/vscode-extensions/
-  .config/Code-Thin/                 thin-client/tmp/
-  .local/bin/ launch/setup scripts   thin-client/legacy-backups/
+HOME (persistent)
+  SSH keys/config and Git config (untouched)
+  .config/BraveSoftware/Brave-Browser/
+  .config/Code-Thin/
+  .config/Spotify-Thin/
+  .codex/
+  .claude/ and .claude.json
+  .local/bin/ launch/setup scripts
+  .local/share/thin-client/
+    vscode-extensions/, fonts/, theme-sources/, icons/
           |
           +-- VS Code Remote SSH --> optional remote server
                                       projects, Node, containers, databases,
-                                      compilers, language servers, Codex
+                                      compilers and language servers
+
+GOINFRE (disposable)
+  thin-client/apps/{brave,vscode,spotify}/releases/
+  thin-client/apps/*/current
+  thin-client/apps/{codex,claude,pyenv}/
+  thin-client/cache/, tmp/, legacy-backups/
 ```
 
 A remote server is **optional**. Native VS Code can edit local files too. This
@@ -39,8 +48,9 @@ legacy backups are temporary fallbacks, not durable backups.
 ## Moving to another 1337 post
 
 **HOME persists; goinfre is local to each workstation.** Your Brave profile,
-Code-Thin state, SSH files and installed wrappers can survive while app binaries,
-extensions and cache targets disappear. After quitting applications, restore them
+Code-Thin state, the isolated Spotify login/profile, extensions/theme/fonts,
+Codex/Claude state, desktop icons, SSH files
+and installed wrappers can survive while app binaries and cache targets disappear. After quitting applications, restore them
 explicitly from a normal host terminal:
 
 ```sh
@@ -48,27 +58,51 @@ explicitly from a normal host terminal:
 ~/.local/bin/thin-client-setup prepare
 ```
 
+The normal per-post flow is:
+
+1. Run `~/.local/bin/thin-client-setup status` once after signing in.
+2. If everything is present, run nothing else; open the applications normally.
+3. If it reports a new/unprepared workstation and goinfre is writable, fully quit
+   Brave, Spotify, VS Code, Codex and Claude, then run the single command
+   `~/.local/bin/thin-client-setup prepare`.
+4. If goinfre is read-only, existing applications still launch. `desktop`, `theme`
+   and `pyenv integrate` can repair HOME integration, but missing goinfre binaries
+   cannot be installed until the school provides a writable goinfre mount.
+
 Status reports **New/unprepared workstation detected** when app executables are
 missing. Clicking a launcher never downloads anything. Preparation recreates
-missing cache targets behind existing correct links and restores applications
-and extensions; it preserves prepared profiles. If goinfre itself is unavailable,
+missing cache targets behind existing correct links and restores applications;
+it preserves profiles and persistent extensions. If goinfre itself is unavailable,
 locate the school's account-owned storage first. Detection prefers `~/goinfre`
 when no explicit `GOINFRE` override is set; no username is hardcoded.
+
+Some school images mount an existing goinfre read-only. Launchers can still use
+already-installed binaries with persistent extensions: disposable caches and temporary
+files switch to a private `/tmp/thin-client-runtime-<uid>` directory for that post.
+Application/CLI installation, update and migration still require writable goinfre;
+the theme command can repair the persistent extension bundle on a read-only post.
+The installer keeps its canonical launchers in `~/.local/bin` and also creates
+managed forwarding shims in `~/bin`, because some school images reset `PATH` but
+retain `~/bin` as the first command directory.
 
 ## Requirements
 
 - Linux x86_64; Python 3.10+ from the system (stdlib only; no pip installation).
-- `curl`, `rsync`, `ps`, `du`, `df`, `xdg-mime`, `xdg-settings`.
+- `curl`, `gpg`, `rsync`, `ps`, `du`, `df`, `xdg-mime`, `xdg-settings`,
+  `snap` and `unsquashfs`. Spotify also needs the matching system core Snap
+  declared by its package (normally `core22`) mounted under `/snap`.
 - Optional: Flatpak for old-app detection; `update-desktop-database` for menu cache
   refresh. Existing Flatpak support is used when present, never installed.
-- A writable, account-owned goinfre directory outside HOME on another filesystem.
+- An account-owned goinfre directory outside HOME on another filesystem. It must
+  be writable for installation/update; an existing installation may launch from
+  a read-only mount using private transient storage.
 - At least 3 GiB free in goinfre for application staging, plus enough HOME space
   for a profile copy and a 200 MiB reserve. The old profile remains during testing.
 - Host libraries compatible with the current official Brave/VS Code builds,
   a graphical desktop session, and working system HTTPS certificates.
 
 Run from a normal host terminal. Container/Flatpak/Codex sandboxes may hide
-processes, GPU nodes, the desktop bus or make goinfre read-only. The tool does not
+processes, GPU nodes or the desktop bus. The tool does not
 escape these boundaries, change permissions on shared storage, or use sudo.
 
 ## Get and inspect the project
@@ -108,10 +142,19 @@ The tool reports running apps and refuses risky steps; it never force-kills them
 ```
 
 Preparation installs the small setup script under `~/.local/bin`, downloads
-official releases, verifies SHA-256, stages/version-controls app releases, copies
-selected persistent data, installs Remote SSH and its small dependencies, then
-writes managed launchers and the VS Code URI handler. It does **not launch apps**
-or retire old profiles. Existing unmanaged destinations are refused.
+official releases, verifies release integrity, stages/version-controls app releases,
+copies selected persistent data, installs Remote SSH, Islands Dark and its companion
+extensions in persistent HOME, installs Codex CLI and Claude Code in goinfre,
+installs pinned pyenv with Python versions in goinfre, provisions the Codex daemon
+package, provisions the official stable Spotify Snap payload, then writes managed launchers with
+persistent icons and VS Code/Spotify URI handlers. It does
+**not launch apps** or retire old profiles. Existing unmanaged destinations are
+refused.
+
+Theme downloads may be staged on goinfre, `/tmp`, or HOME, but final theme files
+are copied into persistent HOME before atomic activation. A retained, validated
+download is reused after interruption, including when staging and HOME are on
+different filesystems.
 
 Separate commands are available for troubleshooting:
 
@@ -119,8 +162,28 @@ Separate commands are available for troubleshooting:
 ./thin-client-setup install
 ./thin-client-setup migrate
 ./thin-client-setup integrate
+./thin-client-setup theme
+./thin-client-setup codex prepare
+./thin-client-setup claude prepare
+./thin-client-setup spotify prepare
+./thin-client-setup pyenv prepare
 ./thin-client-setup status
 ```
+
+`desktop` also creates per-user `Hidden=true` overrides for a root-owned school
+VS Code launcher and routes the `code` command and `vscode:` URLs to the native
+thin-client build. It does not and cannot delete `/usr/share/code` without sudo.
+The managed VS Code preferences keep Remote-SSH's local server enabled, use its
+classic server transport instead of the managed exec-server path, and allow a
+30-second initial connection on slower or relayed networks. Remote terminals use
+full-color local echo so keystrokes display immediately over higher-latency links.
+Smooth caret/list/terminal animations are disabled, theme transitions are reduced,
+minimap characters are replaced with cheaper blocks, and generated monorepo trees
+such as `node_modules`, `.next`, `dist`, and `build` are excluded from continuous
+file watching. The directories remain accessible; this only avoids watcher storms.
+The managed pyenv shell block also removes the school image's stale
+`pyenv-virtualenv` prompt hook when the managed core pyenv is active; this avoids
+spurious `pyenv: no such command sh-activate` errors.
 
 Fresh accounts without Flatpak profiles get new empty native profiles. Accounts
 with native destination data that this tool did not create require manual review;
@@ -162,23 +225,72 @@ convenient way to retain preferences, but can reinstall unwanted extensions;
 review extension sync choices for this thin-client architecture.
 
 The native client uses supported `--user-data-dir` and `--extensions-dir` options.
-Only Remote SSH and its small extension pack are installed by default. Install
-language servers/development extensions on the SSH remote when appropriate;
-large C/C++ tooling is not migrated locally.
+Remote SSH and a pinned post-0.0.2 Islands Dark revision are installed by default. The setup
+includes Custom UI Style, the recommended Seti Folder icons, Bear Sans UI fonts,
+and the upstream theme settings, including its corrected activity-bar, Explorer,
+terminal and panel geometry. A low-glare charcoal/blue palette, Noto Sans Mono
+editor/terminal typography, smooth navigation and restrained minimap are layered
+on top for the school Linux image. The terminal uses a saturated Tango-style
+ANSI palette matching the Oh My Zsh prompt, with a standard 4.5:1 minimum
+contrast ratio. Existing unrelated settings are preserved and a
+pre-theme settings backup is kept under `~/.local/share/thin-client`. On the first
+launch (and after a VS Code update), run **Custom UI Style: Reload** from the
+Command Palette to activate the rounded-panel CSS. Use `thin-client-setup theme`
+to restore only the theme without reinstalling the applications. Install language
+servers/development extensions on the SSH remote when appropriate; large C/C++
+tooling is not migrated locally.
 
 ## Launch and desktop integration
 
 ```sh
 ~/.local/bin/brave-native
 ~/.local/bin/code-native
+~/.local/bin/spotify
 ```
 
-Or use **Brave (native thin client)** and **VS Code (native thin client)** in the
+Or use **Brave (native thin client)**, **VS Code (native thin client)** and
+**Spotify** in the
 app menu. Launchers never download code. If goinfre was cleared, explicitly rerun
 `~/.local/bin/thin-client-setup prepare` to restore reproducible app files.
 
-No shell startup file is changed. Use full launcher paths, or add the personal
-bin directory to PATH yourself after review.
+### Official Spotify client
+
+The installer asks the system `snap` client to download Spotify's current stable
+revision and its `core24`, `gnome-46-2404`, `mesa-2404`, and theme runtimes from
+the Snap Store without installing anything system-wide. It verifies every
+downloaded payload's size and SHA3-384 against its Store assertion, requires each
+package's pinned Store identity, then extracts versioned payloads into goinfre.
+The [Spotify Linux download page](https://www.spotify.com/us/download/linux/)
+documents the Snap installation method, and the [Snap Store listing](https://snapcraft.io/spotify)
+shows the package is published by Spotify's verified account. No sudo is used.
+
+The official native client keeps its persistent login and preferences under
+`~/.config/Spotify-Thin`; generated cache data is directed to
+`goinfre/thin-client/cache/spotify`. The `spotify` and `spotify-native` commands,
+desktop entry and `spotify:` deep links all launch this same native client. The
+desktop icon is copied into persistent HOME so changing posts does not produce a
+generic fallback icon.
+
+Spotify's current build requires a newer glibc than older school posts provide.
+The launcher uses `/usr/bin/bwrap` to place the managed `core24` filesystem and
+desktop/GPU providers around Spotify for that process only. This avoids the host
+glibc mismatch and does not require sudo, system Snap installation, or changes by
+school staff. The first Spotify prepare is consequently a larger download; later
+launches are local and launchers themselves never download. Preparation also
+seeds the provider layout targets declared by Spotify's signed `snap.yaml`, so
+they remain usable on later read-only posts. The launcher mounts those layouts
+and prefers the host PulseAudio-compatible socket, falling back to native
+PipeWire when that is the only available session service; an explicit
+`--audio-api=...` argument remains available for diagnosis. It also ignores the
+system NetworkManager bus on school images where working internet is incorrectly
+reported as disconnected; the user session bus remains available for normal
+desktop integration. Detailed client logging is opt-in with
+`THIN_CLIENT_SPOTIFY_DEBUG=1 spotify`, keeping normal sessions from accumulating
+large debug files.
+
+Only an explicitly marked, idempotent pyenv block is added to `.zshrc` and
+`.bashrc`; all other shell content is preserved. Use full application launcher
+paths, or add the personal bin directory to PATH yourself after review.
 
 The normal Code desktop entry opens files with `%F`. A separate hidden
 `code-native-url-handler.desktop` calls the native wrapper with `--open-url %U`
@@ -236,11 +348,17 @@ they do not perform live OAuth or prove keyring/network/provider behavior.
 
 ## Cache policy
 
-Brave uses `XDG_CACHE_HOME` in goinfre while its profile stays under HOME's
-`.config`. Known profile-local disposable caches also point into goinfre.
+Brave and the isolated Spotify app use `XDG_CACHE_HOME` in goinfre while their profiles stay under HOME's
+`.config`. Known profile-local disposable caches also point into goinfre. On a
+read-only post, those disposable links switch to the private runtime directory
+under `/tmp` and switch back automatically on a writable post.
 The HTTP disk-cache target is approximately **100 MiB**, not a hard limit on all
 browser storage. Persistent site databases, history and extensions can still grow.
-No GPU forcing or sandbox-disabling flags are added.
+When a readable/writable DRM render node is available, launchers request GPU
+rasterization and zero-copy and bypass Chromium's conservative GPU blocklist.
+When `/dev/dri/renderD*` is unavailable, they report software rendering rather
+than pretending that application flags can replace a missing host driver. Browser
+and Electron sandboxes remain enabled.
 
 VS Code's persistent user-data directory, including unsaved-file backups, remains
 in HOME. Only specifically named generated cache/log directories use links into
@@ -252,8 +370,9 @@ a clear failure.
 
 Brave cache setup uses an explicit relative-path table, not cache-name searches.
 For `Default` and `Profile <number>`, it manages only direct `Cache`, `Code Cache`,
-`GPUCache`, `DawnGraphiteCache`, `DawnWebGPUCache`, `GrShaderCache`, and `ShaderCache`
-paths. The Brave root has a separate explicit table for those paths plus the
+`GPUCache`, `DawnGraphiteCache`, `DawnWebGPUCache`, `GrShaderCache`, `ShaderCache`,
+`BrowserMetrics`, `Crash Reports`, `Crashpad`, `component_crx_cache`, and
+`extensions_crx_cache` paths. The Brave root has a separate explicit table for those paths plus the
 root-level rendering caches `GraphiteDawnCache` and `GPUPersistentCache`.
 Existing real directories at those exact paths can be redirected after Brave is
 fully stopped. Symlink ancestors and mount points are
@@ -347,6 +466,10 @@ removed. A symlink path/ancestor is refused. System Flatpak binaries/runtimes ar
 not uninstalled and do not count as HOME recovery. Goinfre backup manifests can
 contain personal paths; never commit them to this repository.
 
+The VS Code retirement command removes only the old per-user Flatpak data. It
+does not remove the root-owned school VS Code; `desktop` hides that launcher for
+this user and ensures the native wrapper wins in new shells.
+
 ## Updates, failures and rollback
 
 **`git pull` updates the checkout, not `~/.local/bin/thin-client-setup`.** Both
@@ -420,69 +543,107 @@ Temporary legacy backups are reference/recovery copies, not database fragments
 to merge into an active profile. Before retirement, old Flatpak launchers remain
 an independent fallback; new native changes are not synced back to them.
 
-## Optional Codex storage: investigation and safe alternatives
+## Codex CLI and Claude Code storage
 
-The requested automatic persistent-state/disposable-package split is **deferred**.
-This release adds a read-only storage diagnostic, without executing Codex:
+`prepare` installs both coding CLIs without sudo. Their executable packages are
+disposable and live in goinfre; personal configuration, authentication and
+sessions remain in persistent HOME:
 
 ```sh
 ~/.local/bin/thin-client-setup codex status
+~/.local/bin/thin-client-setup claude status
+codex
+claude
 ```
 
-`codex install` and `codex prepare` deliberately refuse without downloading,
-moving data or creating wrappers. Normal Brave/Code preparation never installs
-Codex. Existing Codex installations, auth, config and databases remain untouched.
+The managed Codex launcher always sets `CODEX_HOME=~/.codex`. During installation,
+the [official Codex installer](https://learn.chatgpt.com/docs/codex/cli/) runs with a
+separate installer-only `CODEX_HOME` and `CODEX_INSTALL_DIR`, both under
+`goinfre/thin-client/apps/codex`. This is necessary because the
+[official environment-variable reference](https://learn.chatgpt.com/docs/config-file/environment-variables)
+states that Codex standalone package metadata normally belongs below `CODEX_HOME`.
+The installer is downloaded to retained staging first and is never piped directly
+into a shell. It starts the managed app-server once to provision and verify its
+package, then stops it. At runtime the persistent `~/.codex` state root is selected, while
+`~/.codex/packages` is a managed link to the installer package directory in
+goinfre. This also keeps the large app-server daemon package out of HOME.
 
-Current [official environment-variable documentation](https://learn.chatgpt.com/docs/config-file/environment-variables)
-defines `CODEX_HOME` as the entire Codex state root, including config, auth,
-sessions, logs, skills and standalone package metadata. It must already exist.
-`CODEX_INSTALL_DIR` changes the visible command location; standalone packages
-still live under `CODEX_HOME/packages/standalone`. These are separate concerns.
-The local 0.161.0 layout is not a portable specification of future releases.
-
-| Category | Persistence decision |
+| Category | Location |
 | --- | --- |
-| Standalone executables and app-server packages | Reproducible payloads; no independent root for all managed packages was established in current official configuration |
-| Downloads, generated caches and plugin package resources | Often reproducible, but not a supported single disposable subtree |
-| Config and authentication | Persistent/sensitive; credentials may use files or the OS keyring |
-| Sessions, history and SQLite-backed runtime state | User state; never blindly moved or marked disposable |
-| User skills and plugin configuration | May be user-authored/persistent; plugin resources can mix reproducible and user state |
+| Codex executable and installer package cache | `goinfre/thin-client/apps/codex/` |
+| Codex config, auth, sessions, history, skills and plugins | `~/.codex/` |
+| Claude executable releases | `goinfre/thin-client/apps/claude/releases/` |
+| Claude config, auth, sessions, skills and plugins | `~/.claude/` (and Claude's `~/.claude.json`) |
+| CLI temporary files | `goinfre/thin-client/tmp/{codex,claude}/`, or private `/tmp` runtime storage on a read-only post |
 
-The [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
-documents `sqlite_home` and `log_dir`, but they do not supply a root for all heavy
-packages. No selective package/daemon/plugin symlink scheme is implemented:
-its safety across installers, self-updates and new posts has not been established.
-The diagnostic reports presence of known paths only; it never prints auth/config
-contents or opens databases.
+Claude is installed as the official Linux x64 native binary in a versioned
+directory. The setup verifies Anthropic's manifest signature against the published
+fingerprint and then verifies the binary SHA-256 and size. Its managed launcher
+sets `CLAUDE_CONFIG_DIR=~/.claude` and `DISABLE_UPDATES=1`; this prevents Claude's
+self-updater from writing executable versions into HOME. Rerun `prepare` (or
+`claude prepare`) to update it. Old goinfre releases are intentionally retained so
+a running session's executable is never removed underneath it, matching
+[Anthropic's network-storage guidance](https://code.claude.com/docs/en/setup#install-on-network-storage).
 
-Supported alternatives have explicit tradeoffs:
+On an existing official Codex/Claude installation, the setup may replace only a
+recognized `~/.local/bin/{codex,claude}` symlink whose target is under the vendor's
+normal HOME package directory. It preserves those old package files. Any unrelated
+command, regular file, or unexpected symlink is refused instead of overwritten.
+Status only reports path presence; it never reads credential or configuration
+contents. After moving posts, check `status`; run `prepare` on a writable post if
+any package is missing.
+The first `codex prepare` with an existing real `~/.codex/packages` directory
+requires every Codex process to be closed. It makes and verifies a temporary
+package-only recovery copy under goinfre, removes only the HOME package copy, and
+restores non-standalone runtime packages into the active goinfre package tree
+before creating the managed link. Authentication, configuration, databases,
+sessions, history, skills and plugins are not relocated or deleted. A retry also
+repairs a missing app-server daemon from the verified recovery copy.
+If an existing read-only installation has the standalone Codex CLI but no daemon
+package, the launcher automatically prepends Codex's supported `--no-daemon`
+option. This keeps sessions usable on that post and returns to daemon mode
+automatically after `codex prepare` repairs the package on writable goinfre.
 
-- Keep the normal persistent `CODEX_HOME` in HOME, with an independently installed
-  CLI executable/package in goinfre. This moves that executable only and does not
-  guarantee that managed daemon/plugin packages or sessions stop growing in HOME.
-- Put an independent **whole** `CODEX_HOME` in detected goinfre. This reduces HOME
-  usage but makes auth, config, sessions, skills and packages disposable together.
-  A new post needs a new install and login; it does not meet the requested
-  persistent-state requirement. The repo does not silently select this mode.
-- Run Codex on a persistent remote machine, using local native Code over SSH.
+## pyenv
 
-Until a supported full split is established, this repository does not promise
-both a tiny local Codex HOME and workstation-independent persistent Codex state.
+`prepare` installs a pinned pyenv release under `goinfre/thin-client/apps/pyenv`.
+The stable pyenv root keeps `versions`, `shims` and its download cache outside
+HOME, while versioned pyenv program releases can be updated independently. The
+managed shell block is deliberately appended after the school/Oh My Zsh setup,
+fixing school images whose later `PATH=` assignment otherwise produces
+`pyenv: command not found`.
+
+```sh
+~/.local/bin/thin-client-setup pyenv status
+~/.local/bin/thin-client-setup pyenv integrate  # repair shell PATH; works read-only
+~/.local/bin/thin-client-setup pyenv prepare    # install pyenv; needs writable goinfre
+exec zsh
+pyenv --version
+```
+
+The integration temporarily falls back to the school `/opt/pyenv` when the
+managed copy has not yet been installed. pyenv itself does not require Python,
+but compiling a selected CPython version still requires the compiler and header
+libraries documented by upstream; without sudo, those dependencies must already
+be present on the school image. No Python version is selected automatically.
 
 ## Troubleshooting
 
 - Missing goinfre: locate/create your school-provided account directory and set
   `GOINFRE` explicitly if needed. The tool will not consume HOME for binaries.
-- Read-only/sandbox errors: use a normal terminal on the host, not a Flatpak or
-  restricted agent terminal. Do not bypass permissions with sudo.
+- Read-only goinfre: existing apps launch with private `/tmp` caches; updates and
+  preparation must wait for a writable post. Do not bypass permissions with sudo.
+- Sandbox errors: use a normal terminal on the host, not a Flatpak or restricted
+  agent terminal.
 - Existing data/cache conflict: inspect the named path. Do not delete it blindly.
 - GitHub sign-in stuck: run `desktop`, check `xdg-mime query default
   x-scheme-handler/vscode`; optionally select `browser-default`. Then fully restart
   native Code and retry. `doctor` only reports mappings; it never authenticates.
 - Browser profile lock: quit other instances and investigate ownership/stale
   workstation state. The tool intentionally does not delete locks automatically.
-- Graphics still software-only: inspect `brave://gpu` and host drivers. Native
-  packaging may solve a runtime mismatch but cannot fix every graphics problem.
+- Graphics still software-only: run `doctor`, inspect `brave://gpu`, `/dev/dri`,
+  and host drivers. If no DRM render node exists, only school administrators can
+  bind/fix the GPU driver; application flags cannot create a hardware device.
 
 ## Development and privacy
 
@@ -492,13 +653,13 @@ python3 -B -m unittest discover -s tests -v
 ```
 
 Tests use temporary fixtures/mocks, never real profiles. They cover traversal and
-link rejection, checksums, goinfre validation, cache/launcher safety, exact
-retirement paths, JSONC, fresh accounts and read-only dry runs. Release tests run
+link rejection, checksums, writable/read-only goinfre validation, transient cache
+switching, conditional GPU flags, exact retirement paths, JSONC and fresh accounts. Release tests run
 the real self-install command in a temporary HOME, load that installed copy for
 the friend's Brave-cache scenario, exercise the generated callback wrapper, and
 simulate XDG defaults, cross-filesystem backups and empty-post recovery. External
-auth and Codex installers are not executed. Development never applies setup to
-the developer's live HOME.
+auth and live Codex/Claude installers are not executed. Development never applies
+setup to the developer's live HOME.
 
 Do not add real profiles, audit dumps, auth files, SSH material or legacy backups.
 The repository ignores common generated/personal artifacts. Review every staged

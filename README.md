@@ -16,16 +16,14 @@ browser can use the host graphics stack instead. This is a compatibility approac
 not a guarantee of hardware acceleration: verify your actual renderer.
 
 ```text
-HOME (persistent)
-  SSH keys/config and Git config (untouched)
-  .config/BraveSoftware/Brave-Browser/
-  .config/Code-Thin/
-  .config/Spotify-Thin/
-  .codex/
-  .claude/ and .claude.json
-  .local/bin/ launch/setup scripts
-  .local/share/thin-client/
-    vscode-extensions/, fonts/, theme-sources/, icons/
+HOME                              GOINFRE (disposable)
+  SSH keys/config (untouched)        thin-client/apps/{brave,vscode}/releases/
+  shell/Git config (untouched)       thin-client/apps/*/current
+  .config/BraveSoftware/             thin-client/cache/
+    Brave-Browser/                  thin-client/vscode-extensions/
+  .config/Code-Thin/                 thin-client/runtime/brave/{config,cache}/
+                                    thin-client/tmp/
+  .local/bin/ launch/setup scripts   thin-client/legacy-backups/
           |
           +-- VS Code Remote SSH --> optional remote server
                                       projects, Node, containers, databases,
@@ -55,7 +53,9 @@ explicitly from a normal host terminal:
 
 ```sh
 ~/.local/bin/thin-client-setup status
-~/.local/bin/thin-client-setup prepare
+thin-client-setup prepare
+brave-native
+code-native
 ```
 
 The normal per-post flow is:
@@ -71,8 +71,10 @@ The normal per-post flow is:
 
 Status reports **New/unprepared workstation detected** when app executables are
 missing. Clicking a launcher never downloads anything. Preparation recreates
-missing cache targets behind existing correct links and restores applications;
-it preserves profiles and persistent extensions. If goinfre itself is unavailable,
+missing cache targets behind existing correct links and restores applications
+and extensions, including Brave runtime config/cache directories; it preserves
+prepared profiles. No repository clone is needed on each new post: the installed setup
+script is sufficient. If goinfre itself is unavailable,
 locate the school's account-owned storage first. Detection prefers `~/goinfre`
 when no explicit `GOINFRE` override is set; no username is hardcoded.
 
@@ -198,8 +200,10 @@ Destination: `~/.config/BraveSoftware/Brave-Browser`.
 Preserves bookmarks, history, login/cookie databases, Local State, preferences,
 extensions and their state, IndexedDB/local storage and sessions. Omits known
 caches only at explicitly approved relative paths, plus runtime locks and sockets.
-Service Worker registration databases, installed scripts and CacheStorage remain
-together in HOME. Anchored, directory-only rsync exclusions also preserve unknown
+Initial migration skips each supported profile’s entire `Service Worker` subtree,
+including old symlinks; the source stays untouched. Existing native Service Worker
+state is never managed or imported from goinfre. Anchored, directory-only cache
+exclusions also preserve unknown
 nested directories with cache-like names and unexpected files at cache locations.
 A checksum-based rsync dry run verifies the persistent
 copy before its staged directory is renamed into place.
@@ -325,6 +329,39 @@ native Brave -> vscode:// callback -> code-native-url-handler.desktop
              -> code-native --open-url <callback> -> Code-Thin
 ```
 
+Desktop setup copies each application's official bundled PNG into persistent
+`~/.local/share/icons/hicolor/<size>x<size>/apps/`:
+
+- Brave: `product_logo_256.png` → `256x256/apps/brave-native.png` (currently 256×256).
+- Code: `resources/app/resources/linux/code.png` → `1024x1024/apps/code-native.png`
+  (currently 1024×1024).
+
+The directory size comes from each PNG; bytes are copied unchanged, without
+separate downloads or system/Flatpak icon dependencies. Both native launchers
+and the hidden Code callback entry use absolute persistent `Icon=` paths, so
+GNOME icon-theme lookup and changing posts do not break their icons. `prepare`,
+`integrate`, and `desktop` restore missing icons and refresh user icon/desktop
+caches when the corresponding utilities are available. `desktop` requires both
+native releases to be present; use `prepare` first on a new workstation.
+Cache refresh is best-effort; missing or failing optional utilities do not block
+setup. If GNOME still shows stale results, logout/login refreshes its shell cache.
+
+Desktop setup preserves or creates user-level `Hidden=true` overrides for
+`com.brave.Browser.desktop`, `org.mozilla.firefox.desktop`, and
+`com.visualstudio.code.desktop`. It also discovers system Brave and Microsoft Visual Studio Code
+entries in standard system/XDG and Flatpak application directories and masks their
+actual desktop IDs (for example `code.desktop` or `brave-browser.desktop`).
+Code detection requires exact Code
+identity in the main desktop group: `Name=Visual Studio Code`,
+`X-Flatpak=com.visualstudio.code`, or the known Flatpak desktop ID. Brave detection requires its exact Flatpak
+identity, or an exact reviewed Brave name paired with a Brave executable
+(`brave`, `brave-browser`, or `brave-browser-stable`). Chrome, Chromium and native
+thin-client launchers are excluded. Detection never uses
+substring matching, masks native thin-client launchers, changes system files,
+uninstalls software, or hides unrelated editors such as Code::Blocks. Existing
+unmanaged user launchers with conflicting IDs are refused rather than overwritten.
+`status` and `doctor` report the persistent icon targets and detected Brave/Code masks.
+
 The normal `code-native.desktop` entry remains a file/folder launcher using `%F`.
 Only the dedicated callback entry registers `x-scheme-handler/vscode`, with
 `--open-url %U`. External HTTP/HTTPS URLs use `brave-native.desktop`, and
@@ -334,8 +371,8 @@ Electron opens external URLs through the desktop's default applications;
 [VS Code's URI integration](https://code.visualstudio.com/api/advanced-topics/remote-extensions#callbacks-and-uri-handlers)
 supports native OAuth callbacks. Native Code drops an inherited `BROWSER`
 variable from its own environment because `xdg-open`'s generic fallback can use
-it. No browser executable is forced, and shell/Brave environments are unchanged.
-Managed setup queries and app launches use HOME's `.config` and `.local/share`
+it. No browser executable is forced, and the shell environment is unchanged.
+Desktop-handler queries and Code launches use HOME's `.config` and `.local/share`
 for XDG configuration and desktop entries.
 
 Run `thin-client-setup status` or `doctor` to see the actual default browser,
@@ -348,10 +385,18 @@ they do not perform live OAuth or prove keyring/network/provider behavior.
 
 ## Cache policy
 
-Brave and the isolated Spotify app use `XDG_CACHE_HOME` in goinfre while their profiles stay under HOME's
-`.config`. Known profile-local disposable caches also point into goinfre. On a
-read-only post, those disposable links switch to the private runtime directory
-under `/tmp` and switch back automatically on a writable post.
+Brave receives process-local runtime directories under validated goinfre:
+
+- `XDG_CONFIG_HOME=<thin-client-root>/runtime/brave/config`
+- `XDG_CACHE_HOME=<thin-client-root>/runtime/brave/cache`
+
+Both are created safely before launch and reconstructed by `prepare`. The real
+profile remains `~/.config/BraveSoftware/Brave-Browser`, selected explicitly with
+`--user-data-dir`; runtime configuration does not select another profile. This
+avoids inherited runtime configuration causing Crashpad startup failures. No
+global environment or shell configuration changes. Code and desktop-handler
+commands retain their own environment. Known profile-local disposable caches
+also point into goinfre.
 The HTTP disk-cache target is approximately **100 MiB**, not a hard limit on all
 browser storage. Persistent site databases, history and extensions can still grow.
 When a readable/writable DRM render node is available, launchers request GPU
@@ -392,8 +437,9 @@ qualify. Cache setup does not inspect, redirect, relocate, or validate as caches
   and `Whatever/GPUCache`
 
 These remain persistent HOME data. Their presence never blocks cache setup.
-Migration and retirement backups use the same exact-path model for cache
-exclusions and preserve this site state. Full `migrate`, `integrate`, and `prepare`
+Migration and retirement backups use the same exact-path model for disposable
+cache exclusions. Initial migration additionally skips Service Worker state;
+explicit retirement backups preserve the source data. Full `migrate`, `integrate`, and `prepare`
 still prepare both apps.
 
 Existing prepared users need no additional profile migration for this cache fix:
@@ -411,10 +457,10 @@ An unapproved path is never offered to cache-link setup. A direct attempt to
 manage one is refused before cache validation. No `Dawn*` or `*Cache*` pattern
 grants relocation permission.
 
-This update does not rewrite old Service Worker symlinks or re-import an existing
-native profile. If an older setup already redirected or omitted site state,
-review the retained Flatpak source or backup before restoring it with Brave
-stopped. Existing browser/site data is never overwritten automatically.
+Service Worker storage is outside normal thin-client management. Missing paths
+remain absent; existing directories and symlinks remain untouched. Brave may
+recreate local site state naturally. No command restores old goinfre Service
+Worker data into HOME or recreates the old redirection design.
 
 Prior application releases and downloads are retained for rollback. Audit their
 space periodically; this tool does not silently prune them.

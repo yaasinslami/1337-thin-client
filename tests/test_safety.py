@@ -45,6 +45,10 @@ class SafetyTests(unittest.TestCase):
             STATE=self.home / '.local/share/thin-client',
             SELF=self.home / '.local/bin/thin-client-setup', BWRAP=self.bwrap)
         self.patch.start()
+        directories = mock.patch.object(tool, 'system_application_dirs',
+                                        return_value=[self.base / 'system/applications'])
+        directories.start()
+        self.addCleanup(directories.stop)
         self.addCleanup(self.patch.stop)
 
     def tar(self, members):
@@ -136,10 +140,10 @@ class SafetyTests(unittest.TestCase):
         root = self.root.parent
         def replacement(path, *args, **kwargs):
             result = original(path, *args, **kwargs)
-            if path == root:
+            if path == root or root in path.parents:
                 data = list(result)
                 data[2] += 1
-                if uid is not None:
+                if path == root and uid is not None:
                     data[4] = uid
                 return os.stat_result(data)
             return result
@@ -209,6 +213,20 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             tool.cache_link(path, self.root / 'cache')
         self.assertEqual((path / 'important').read_text(), 'keep')
+
+    def icon_fixture(self):
+        import base64
+        release = self.root / 'apps/vscode/releases/fixture'
+        source = release / 'resources/app/resources/linux/code.png'
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(base64.b64decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='))
+        (self.root / 'apps/vscode/current').symlink_to(release, target_is_directory=True)
+        brave = self.root / 'apps/brave/releases/fixture'
+        brave.mkdir(parents=True, exist_ok=True)
+        (brave / 'product_logo_256.png').write_bytes(source.read_bytes())
+        (self.root / 'apps/brave/current').symlink_to(brave, target_is_directory=True)
+        return source
 
     def native_fixture(self, app):
         profile = tool.BRAVE if app == 'brave' else tool.CODE
@@ -1122,6 +1140,7 @@ class SafetyTests(unittest.TestCase):
         (self.home / '.local/bin').mkdir(parents=True)
         self.desktop_icon_fixtures()
         with mock.patch.object(tool, 'run'):
+            self.icon_fixture()
             tool.desktop_integration(self.root)
         applications = self.home / '.local/share/applications'
         normal = (applications / 'code-native.desktop').read_text()

@@ -10,7 +10,7 @@ Official-download ideas adapted from shank187/session-setup (MIT); see
 README.md and THIRD_PARTY_NOTICES.md for attribution and storage details.
 """
 import argparse
-import base64
+import configparser
 import fcntl
 import hashlib
 import json
@@ -21,6 +21,7 @@ import select
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -37,22 +38,7 @@ OLD_BRAVE = HOME / '.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browse
 OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
 STATE = HOME / '.local/share/thin-client'
 SELF = HOME / '.local/bin/thin-client-setup'
-VERSION = '0.11.5'
-# The Snap Store identity is stable across Spotify releases.  Downloaded
-# revisions are accepted only when the signed assertion names this exact snap.
-SPOTIFY_SNAP_ID = 'pOBIoZ2LrCB3rDohMxoYGnbN14EHOgD7'
-SPOTIFY_ICON_SHA256 = 'da58c89167809f2516846caf6de161d72c30074d07ce9437b0af743ed6292abd'
-# Spotify's current stable Snap is based on Ubuntu 24.04 and requires newer
-# glibc than the school Ubuntu 22.04 posts provide. Keep the complete signed
-# runtime stack beside Spotify instead of depending on root-owned /snap state.
-SPOTIFY_BASE = 'core24'
-SPOTIFY_RUNTIME_SNAP_IDS = {
-    'core24': 'dwTAh7MZZ01zyriOZErqd1JynQLiOGvM',
-    'gnome-46-2404': 'ew7OxpbRTxfK7ImpIygRR85lkxvU7Pzt',
-    'mesa-2404': 'HyhSEBPv3vHsW6uOHkQR384NgI7S6zpj',
-    'gtk-common-themes': 'jZLfBRzf1cYlYysIjD2bwSzNtngY0qit',
-}
-BWRAP = Path('/usr/bin/bwrap')
+VERSION = '0.3.0'
 BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS = (
     Path('Cache'), Path('Code Cache'), Path('GPUCache'),
     Path('DawnGraphiteCache'), Path('DawnWebGPUCache'),
@@ -1431,6 +1417,11 @@ def migrate_brave(stage):
     if not (OLD_BRAVE / 'Local State').is_file():
         raise RuntimeError('Flatpak Brave source exists but lacks Local State')
     excludes = brave_copy_excludes(OLD_BRAVE)
+    # Never import Service Worker state, including old goinfre-backed links.
+    # Anchor the whole subtree to each supported profile; leave sources intact.
+    profiles = {relative.parts[0] for relative in brave_disposable_relative_paths(OLD_BRAVE)
+                if len(relative.parts) == 2}
+    excludes += [f'--exclude=/{profile}/Service Worker' for profile in sorted(profiles)]
     excludes += ['--exclude=Singleton*', '--exclude=*.lock', '--exclude=*.sock',
                  '--exclude=.org.chromium.*', '--exclude=.thin-client-import']
     dry = run(['rsync', '-an', '--stats', *excludes, str(OLD_BRAVE) + '/', str(stage) + '/'],
@@ -1493,9 +1484,15 @@ def environment(root, app):
     storage = runtime_storage(root)
     env['XDG_CONFIG_HOME'] = str(HOME / '.config')
     env['XDG_DATA_HOME'] = str(HOME / '.local/share')
-    env['XDG_CACHE_HOME'] = str(storage / 'cache' / app)
-    env['TMPDIR'] = str(storage / 'tmp')
-    paths = [storage / 'cache' / app, storage / 'tmp']
+    env['XDG_CACHE_HOME'] = str(root / 'cache' / app)
+    env['TMPDIR'] = str(root / 'tmp')
+    if app == 'brave':
+        # Process-local runtime configuration; the real profile is explicit in argv.
+        env['XDG_CONFIG_HOME'] = str(root / 'runtime/brave/config')
+        env['XDG_CACHE_HOME'] = str(root / 'runtime/brave/cache')
+    paths = [Path(env['XDG_CACHE_HOME']), root / 'tmp']
+    if app == 'brave':
+        paths.append(Path(env['XDG_CONFIG_HOME']))
     if app == 'vscode':
         # xdg-open's generic fallback can honor BROWSER. Use desktop handlers
         # for native Code, without forcing a browser or changing the shell.
@@ -1718,7 +1715,8 @@ def install_vscode_theme(root):
         raise RuntimeError('VS Code is missing: run thin-client-setup prepare first')
     stopped(('vscode',))
     vscode_caches(root)
-    vscode_extensions().mkdir(parents=True, exist_ok=True)
+    brave_caches(root)
+    environment(root, 'brave')  # Reconstruct workstation-local runtime on prepare.
     env = environment(root, 'vscode')
     # Install the requested theme itself before Marketplace companions. This
     # leaves a usable color theme if a school proxy temporarily blocks the
@@ -1729,154 +1727,131 @@ def install_vscode_theme(root):
         run([*code_args(root), '--install-extension', ext], env=env)
     print('Local extension inventory:', flush=True)
     run([*code_args(root), '--list-extensions', '--show-versions'], env=env)
-    print('Islands Dark installed. On first launch run "Custom UI Style: Reload" '
-          'from the Command Palette to activate the rounded-panel CSS.', flush=True)
-
-def integrate(root):
-    if (not (CODE / '.thin-client-import').exists() or
-            not (BRAVE / '.thin-client-import').exists() or
-            not (SPOTIFY / '.thin-client-import').exists()):
-        raise RuntimeError('Complete migration before integration')
-    stopped()
-    brave_caches(root)
-    spotify_caches(root)
-    install_vscode_theme(root)
     desktop_integration(root)
 
-def desktop_icon(root, app):
-    """Copy a vendor icon into persistent HOME for cross-post desktop menus."""
-    sources = {
-        'brave': root / 'apps/brave/current/product_logo_256.png',
-        'code': root / 'apps/vscode/current/resources/app/resources/linux/code.png',
-    }
-    source = sources[app]
-    app_root = (root / 'apps' / ('brave' if app == 'brave' else 'vscode')).resolve()
-    if (not source.is_file() or source.is_symlink() or
-            not source.resolve().is_relative_to(app_root)):
-        raise RuntimeError(f'Missing or unexpected {app} desktop icon: {source}')
-    icons = safe(STATE / 'icons')
-    icons.mkdir(parents=True, exist_ok=True)
-    destination = safe(icons / f'{app}-native.png')
-    if not destination.exists() or digest(destination) != digest(source):
-        temporary = destination.with_name('.' + destination.name + '.pending')
-        shutil.copy2(source, temporary)
-        temporary.chmod(0o644)
-        os.replace(temporary, destination)
-        print(f'Installed persistent desktop icon: {destination}', flush=True)
-    return destination
-
-def spotify_desktop_icon():
-    """Install the requested Spotify artwork into persistent desktop storage."""
-    icons = safe(STATE / 'icons')
-    icons.mkdir(parents=True, exist_ok=True)
-    destination = safe(icons / 'spotify-app.png')
-    source = Path(__file__).resolve().parent / 'assets/spotify-icon.png'
-    if source.is_file() and not source.is_symlink():
-        if digest(source) != SPOTIFY_ICON_SHA256:
-            raise RuntimeError(f'Bundled Spotify icon failed checksum validation: {source}')
-        if not destination.exists() or digest(destination) != SPOTIFY_ICON_SHA256:
-            temporary = destination.with_name('.spotify-app.png.pending')
-            shutil.copy2(source, temporary)
-            temporary.chmod(0o644)
+def install_bundled_icon(root, app, relative, title, command):
+    """Copy the bundled PNG; current may link only into managed releases."""
+    appdir = safe(root / 'apps' / app)
+    releases = safe(appdir / 'releases')
+    release = (appdir / 'current').resolve()
+    if not release.is_relative_to(releases) or release == releases:
+        raise RuntimeError(f'{title} current release is outside managed releases; run prepare')
+    source = safe(release / relative)
+    if not source.is_file():
+        raise RuntimeError(f'Bundled {title} icon missing; run thin-client-setup prepare')
+    payload = source.read_bytes()
+    if len(payload) < 24 or payload[:16] != b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR':
+        raise RuntimeError(f'Invalid bundled {title} PNG: {source}')
+    width, height = struct.unpack('>II', payload[16:24])
+    if width != height or not 1 <= width <= 4096:
+        raise RuntimeError(f'Unexpected bundled {title} icon dimensions: {width}x{height}')
+    theme = safe(HOME / '.local/share/icons/hicolor')
+    destination = safe(theme / f'{width}x{height}/apps/{command}.png')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists() or destination.read_bytes() != payload:
+        fd, temporary = tempfile.mkstemp(prefix=f'.{command}-', dir=destination.parent)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(payload)
+            os.chmod(temporary, 0o644)
             os.replace(temporary, destination)
-            print(f'Installed persistent Spotify icon: {destination}', flush=True)
-    if (not destination.is_file() or destination.is_symlink() or
-            digest(destination) != SPOTIFY_ICON_SHA256):
-        raise RuntimeError('Spotify icon asset is unavailable; run install-self or prepare '
-                           'from the reviewed repository checkout')
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        print(f'Installed bundled {title} icon: {destination}', flush=True)
     return destination
 
-def spotify_open_helper():
-    return safe(STATE / 'helpers/spotify-xdg-open')
+def install_code_icon(root):
+    return install_bundled_icon(root, 'vscode', 'resources/app/resources/linux/code.png',
+                                'VS Code', 'code-native')
 
-def spotify_snapctl_helper():
-    return safe(STATE / 'helpers/snapctl')
+def install_brave_icon(root):
+    # Largest official PNG in the native Brave Linux archive; no theme dependency.
+    return install_bundled_icon(root, 'brave', 'product_logo_256.png', 'Brave', 'brave-native')
 
-def install_spotify_open_helper():
-    """Install a narrow host-portal bridge for links opened by Spotify."""
-    helper = spotify_open_helper()
-    helper.parent.mkdir(parents=True, exist_ok=True)
-    managed_file(helper,
-                 '''#!/bin/sh
-# Managed by thin-client-setup
-if [ "$#" -ne 1 ]; then
-  echo "spotify-xdg-open: expected exactly one URL" >&2
-  exit 2
-fi
-case "$1" in
-  http://*|https://*) ;;
-  *) echo "spotify-xdg-open: refused non-web URL" >&2; exit 2 ;;
-esac
-if [ -n "${THIN_CLIENT_OPEN_FIFO:-}" ] && [ -p "$THIN_CLIENT_OPEN_FIFO" ]; then
-  printf '%s\n' "$1" > "$THIN_CLIENT_OPEN_FIFO"
-  exit $?
-fi
-echo "spotify-xdg-open: host browser bridge unavailable" >&2
-exit 1
-''', 0o755)
-    return helper
+def desktop_fields(path):
+    """Read only the primary desktop group, never action names or commands."""
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    try:
+        parser.read_string(path.read_text())
+        return dict(parser['Desktop Entry']) if parser.has_section('Desktop Entry') else {}
+    except (OSError, UnicodeError, configparser.Error):
+        return {}
 
-def install_spotify_snapctl_helper():
-    """Provide only the connection checks used by the signed desktop chain."""
-    helper = spotify_snapctl_helper()
-    helper.parent.mkdir(parents=True, exist_ok=True)
-    managed_file(helper,
-                 '''#!/bin/sh
-# Managed by thin-client-setup
-if [ "$#" -eq 2 ] && [ "$1" = "is-connected" ]; then
-  case "$2" in
-    gnome-46-2404|gsettings) exit 0 ;;
-  esac
-fi
-echo "spotify-snapctl: unsupported command" >&2
-exit 1
-''', 0o755)
-    return helper
+def system_application_dirs():
+    roots = [Path('/usr/share'), Path('/usr/local/share'),
+             Path('/var/lib/flatpak/exports/share'), HOME / '.local/share/flatpak/exports/share']
+    roots += [Path(value) for value in os.environ.get('XDG_DATA_DIRS', '').split(':')
+              if value and Path(value).is_absolute()]
+    user_apps = (HOME / '.local/share/applications').resolve()
+    data_home = Path(os.environ.get('XDG_DATA_HOME', str(HOME / '.local/share')))
+    excluded = {user_apps, (data_home / 'applications').resolve()}
+    return sorted({(root / 'applications').resolve() for root in roots
+                   if (root / 'applications').resolve() not in excluded})
 
-def spotify_desktop_integration(root, apps=None):
-    """Create the isolated Spotify launcher and register only spotify: links."""
-    apps = apps or HOME / '.local/share/applications'
-    safe(apps).mkdir(parents=True, exist_ok=True)
-    safe(HOME / '.local/bin').mkdir(parents=True, exist_ok=True)
-    icon = spotify_desktop_icon()
-    wrapper = HOME / '.local/bin/spotify'
-    managed_file(wrapper,
-                 '#!/bin/sh\n# Managed by thin-client-setup\n'
-                 f'exec {shlex.quote(str(SELF))} open spotify "$@"\n', 0o755)
-    compatibility_launcher('spotify', wrapper)
-    native_wrapper = HOME / '.local/bin/spotify-native'
-    managed_file(native_wrapper,
-                 '#!/bin/sh\n# Managed by thin-client-setup\n'
-                 f'exec {shlex.quote(str(wrapper))} "$@"\n', 0o755)
-    compatibility_launcher('spotify-native', native_wrapper)
-    managed_file(apps / 'spotify-thin.desktop',
-                 '[Desktop Entry]\n# Managed by thin-client-setup\n'
-                 'Type=Application\nName=Spotify\n'
-                 f'Exec="{wrapper}" %U\nIcon={icon}\n'
-                 'Categories=Audio;Music;Player;AudioVideo;\n'
-                 'StartupWMClass=spotify\nStartupNotify=true\n'
-                 'MimeType=x-scheme-handler/spotify;\n', 0o644)
-    run(['xdg-mime', 'default', 'spotify-thin.desktop',
-         'x-scheme-handler/spotify'], env=xdg_environment())
+def system_app_desktop_ids(app):
+    """Discover exact application identities only in desktop directories."""
+    found = set()
+    for directory in system_application_dirs():
+        for parent, dirs, files in os.walk(directory, followlinks=False):
+            dirs.sort()
+            for name in sorted(files):
+                if not name.endswith('.desktop'):
+                    continue
+                path = Path(parent) / name
+                desktop_id = path.relative_to(directory).as_posix().replace('/', '-')
+                if desktop_id in ('brave-native.desktop', 'code-native.desktop', 'code-native-url-handler.desktop'):
+                    continue
+                fields = desktop_fields(path)
+                if fields.get('Type') != 'Application':
+                    continue
+                try:
+                    argv = shlex.split(fields.get('Exec', ''))
+                except ValueError:
+                    continue
+                if any(Path(arg).name in ('code-native', 'brave-native') for arg in argv):
+                    continue
+                if app == 'vscode':
+                    match = (desktop_id == 'com.visualstudio.code.desktop' or
+                             fields.get('X-Flatpak') == 'com.visualstudio.code' or
+                             fields.get('Name') == 'Visual Studio Code')
+                else:
+                    match = (desktop_id == 'com.brave.Browser.desktop' or
+                             fields.get('X-Flatpak') == 'com.brave.Browser' or
+                             (fields.get('Name') in ('Brave', 'Brave Browser', 'Brave Web Browser') and argv and
+                              Path(argv[0]).name in ('brave', 'brave-browser', 'brave-browser-stable')))
+                if match:
+                    found.add(desktop_id)
+    return sorted(found)
 
-def install_code_shell():
-    """Remove the school/macOS-style zsh function so `code` uses our wrapper."""
-    body = '''# The school profile defines a macOS `open -b` function on Linux.
-if [ -n "${ZSH_VERSION:-}" ]; then
-  unfunction code 2>/dev/null || true
-  rehash
-fi'''
-    managed_shell_block(HOME / '.zshrc', 'native-code', body)
+def system_code_desktop_ids():
+    return system_app_desktop_ids('vscode')
+
+def system_brave_desktop_ids():
+    return system_app_desktop_ids('brave')
+
+def hide_system_applications(apps):
+    # Keep the established browser/Flatpak policy and mask host-specific Brave/Code IDs.
+    names = {'com.brave.Browser.desktop', 'org.mozilla.firefox.desktop',
+             'com.visualstudio.code.desktop', *system_code_desktop_ids(), *system_brave_desktop_ids()}
+    for name in sorted(names):
+        path = safe(apps / name)
+        if path.exists() and desktop_fields(path).get('Hidden') == 'true':
+            continue  # Preserve an existing user hiding override byte-for-byte.
+        managed_file(path, '[Desktop Entry]\n# Managed by thin-client-setup\nHidden=true\n', 0o644)
 
 def desktop_integration(root):
     """Write launchers without installing extensions or requiring apps to quit."""
+    icon_path = install_code_icon(root)
+    brave_icon = install_brave_icon(root)
+    theme = icon_path.parents[2]
     apps = HOME / '.local/share/applications'
     safe(apps).mkdir(parents=True, exist_ok=True)
     safe(HOME / '.local/bin').mkdir(parents=True, exist_ok=True)
-    icons = {app: desktop_icon(root, app) for app in ('brave', 'code')}
-    for app, title, command, category in [
-        ('brave', 'Brave (native thin client)', 'brave-native', 'Network;WebBrowser;'),
-        ('code', 'VS Code (native thin client)', 'code-native', 'Development;IDE;')]:
+    for app, title, command, icon, category in [
+        ('brave', 'Brave (native thin client)', 'brave-native', str(brave_icon), 'Network;WebBrowser;'),
+        ('code', 'VS Code (native thin client)', 'code-native', str(icon_path), 'Development;IDE;')]:
         wrapper = HOME / '.local/bin' / command
         contents = '#!/bin/sh\n# Managed by thin-client-setup\nexec ' + shlex.quote(str(SELF)) + ' open ' + app + ' "$@"\n'
         managed_file(wrapper, contents, 0o755)
@@ -1893,23 +1868,18 @@ def desktop_integration(root):
                  '[Desktop Entry]\n# Managed by thin-client-setup\n'
                  'Type=Application\nName=VS Code (native thin client) - URL Handler\n'
                  f'Exec="{wrapper}" --open-url %U\n'
-                 f'Icon={icons["code"]}\nNoDisplay=true\nStartupNotify=true\n'
+                 f'Icon={icon_path}\nNoDisplay=true\nStartupNotify=true\n'
                  'Categories=Development;IDE;\nMimeType=x-scheme-handler/vscode;\n', 0o644)
-    # The root-owned school VS Code cannot be uninstalled without sudo. User
-    # desktop overrides hide it, while `code` becomes an alias-safe managed
-    # wrapper for the native thin-client build.
-    for name in ('code.desktop', 'code-url-handler.desktop'):
-        managed_file(apps / name,
-                     '[Desktop Entry]\n# Managed by thin-client-setup\nHidden=true\n', 0o644)
-    code_wrapper = HOME / '.local/bin/code'
-    managed_file(code_wrapper,
-                 '#!/bin/sh\n# Managed by thin-client-setup\n'
-                 f'exec {shlex.quote(str(SELF))} open code "$@"\n', 0o755)
-    compatibility_launcher('code', code_wrapper)
-    install_code_shell()
-    spotify_desktop_integration(root, apps)
-    if shutil.which('update-desktop-database'):
-        run(['update-desktop-database', apps], env=xdg_environment())
+    hide_system_applications(apps)
+    for command in [
+            ['gtk-update-icon-cache', '--force', '--ignore-theme-index', theme],
+            ['update-desktop-database', apps]]:
+        if shutil.which(command[0]):
+            try:
+                run(command, env=xdg_environment(), capture_output=True, text=True)
+            except (OSError, subprocess.CalledProcessError) as error:
+                print(f'Optional desktop cache refresh failed: {command[0]} ({type(error).__name__}); '
+                      'logout/login can refresh GNOME menu state.', flush=True)
     run(['xdg-mime', 'default', 'code-native-url-handler.desktop', 'x-scheme-handler/vscode'],
         env=xdg_environment())
     print('Launchers installed; system VS Code hidden for this user; Code and Spotify URI '
@@ -2351,6 +2321,33 @@ def xdg_environment():
     env['XDG_DATA_HOME'] = str(HOME / '.local/share')
     return env
 
+def desktop_menu_diagnostics():
+    apps = HOME / '.local/share/applications'
+    icons = HOME / '.local/share/icons/hicolor'
+    ok = True
+    for title, command, known_id, detected in [
+            ('Brave', 'brave-native', 'com.brave.Browser.desktop', system_brave_desktop_ids()),
+            ('Code', 'code-native', 'com.visualstudio.code.desktop', system_code_desktop_ids())]:
+        entry = apps / f'{command}.desktop'
+        fields = desktop_fields(entry)
+        print(f'Native {title} desktop entry: {"present" if entry.is_file() else "MISSING"}', flush=True)
+        target = Path(fields.get('Icon', ''))
+        valid = (target.is_absolute() and target.name == f'{command}.png' and
+                 target.parent.name == 'apps' and target.parent.parent.parent == icons and
+                 target.is_file() and not target.is_symlink() and target.resolve() == target.absolute())
+        print(f'Native {title} icon: {"present" if valid else "MISMATCH: missing or invalid"}; '
+              f'target: {fields.get("Icon", "unset")}', flush=True)
+        ok = ok and valid
+        print(f'Hidden system {"VS Code" if title == "Code" else title} entries:', flush=True)
+        for name in sorted({known_id, *detected}):
+            match = desktop_fields(apps / name).get('Hidden') == 'true'
+            print(f'  {name}: {"hidden" if match else "MISMATCH: not masked; run thin-client-setup desktop"}', flush=True)
+            ok = ok and match
+    if not ok:
+        print('Run thin-client-setup desktop to restore native icons and system application masks.', flush=True)
+    print('If GNOME retains stale menu entries after desktop setup, logout/login refreshes its shell cache.', flush=True)
+    return ok
+
 def desktop_diagnostics():
     """Report actual defaults against the explicit native deployment choice."""
     checks = [('default web browser', ['xdg-settings', 'get', 'default-web-browser'],
@@ -2380,12 +2377,13 @@ def desktop_diagnostics():
         present = (apps / name).is_file()
         print(f'Expected desktop entry: {apps / name}; {"present" if present else "MISSING"}', flush=True)
         ok = ok and present
+    menu_ok = desktop_menu_diagnostics()
     if 'BROWSER' in os.environ:
         print('BROWSER is set in the shell; native Code omits it and uses desktop handlers.', flush=True)
     if not ok:
         print('For the native deployment, run thin-client-setup defaults brave explicitly. '
               'Diagnostics do not change defaults.', flush=True)
-    return ok
+    return ok and menu_ok
 
 def make_default_browser():
     apps = HOME / '.local/share/applications'

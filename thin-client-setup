@@ -682,6 +682,7 @@ def desktop_integration(root):
                  f'Icon={icon_path}\nNoDisplay=true\nStartupNotify=true\n'
                  'Categories=Development;IDE;\nMimeType=x-scheme-handler/vscode;\n', 0o644)
     hide_system_applications(apps)
+    install_cli_shims()
     for command in [
             ['gtk-update-icon-cache', '--force', '--ignore-theme-index', theme],
             ['update-desktop-database', apps]]:
@@ -760,15 +761,69 @@ def doctor():
     print('Manual checks: brave://version, brave://gpu, WebGL/WebGL2 and your apps; '
           'Code Remote SSH and GitHub sign-in. See README.', flush=True)
 
+def cli_shim_plan():
+    """Accept only exact native-wrapper locations, never basename matches."""
+    directory = safe(HOME / '.local/bin')
+    plan = []
+    for app in ('code', 'brave'):
+        path = directory / app
+        target = directory / (app + '-native')
+        if path.is_symlink():
+            raw = Path(os.readlink(path))
+            old = Path(os.path.abspath(raw if raw.is_absolute() else path.parent / raw))
+            if old == target:
+                continue
+            # Older user-bin native wrappers are the only accepted stale targets.
+            if old != HOME / 'bin' / (app + '-native'):
+                raise RuntimeError(f'Refusing to overwrite unrelated CLI symlink: {path} -> {raw}')
+            safe(old)
+            if old.exists() and (not old.is_file() or
+                    '# Managed by thin-client-setup' not in old.read_text().splitlines()):
+                raise RuntimeError(f'Refusing to replace CLI link to unmanaged wrapper: {path}')
+        elif path.exists():
+            raise RuntimeError(f'Refusing to overwrite existing CLI path: {path}')
+        plan.append((path, target))
+    return plan
+
+def install_cli_shims():
+    plan = cli_shim_plan()  # Check both collisions before changing either link.
+    safe(HOME / '.local/bin').mkdir(parents=True, exist_ok=True)
+    for path, target in plan:
+        if path.is_symlink():
+            # Publish the replacement atomically; never follow the old link.
+            with tempfile.TemporaryDirectory(prefix='.cli-shim-', dir=path.parent) as staging:
+                link = Path(staging) / path.name
+                link.symlink_to(target)
+                os.replace(link, path)
+        else:
+            path.symlink_to(target)  # Refuses a newly appeared collision.
+        print(f'CLI shim: {path} -> {target}', flush=True)
+
+def cli_diagnostics():
+    for app in ('code', 'brave'):
+        path = HOME / '.local/bin' / app
+        target = path.with_name(app + '-native')
+        raw = Path(os.readlink(path)) if path.is_symlink() else None
+        correct = raw is not None and Path(os.path.abspath(
+            raw if raw.is_absolute() else path.parent / raw)) == target
+        print(f'CLI {app}: {path} -> {app}-native; {"OK" if correct else "MISMATCH"}', flush=True)
+        found = shutil.which(app)
+        match = found is not None and Path(os.path.abspath(found)) == path
+        print(f'CLI {app} PATH: {found or "not found"}; '
+              f'{"OK" if match else "MISMATCH: put ~/.local/bin first in PATH; shell configuration unchanged"}', flush=True)
+
 def install_self():
     source = Path(__file__).resolve()
     safe(SELF)
+    cli_shim_plan()
     if source == SELF.resolve():
+        install_cli_shims()
         return
     safe(SELF.parent).mkdir(parents=True, exist_ok=True)
     managed_file(SELF, source.read_text(), 0o755)
     if digest(source) != digest(SELF):
         raise RuntimeError('Installed script differs after update; inspect before proceeding')
+    install_cli_shims()
     print(f'Installed setup {VERSION}: {SELF}; SHA-256 {digest(SELF)}', flush=True)
 
 def script_status():
@@ -827,6 +882,7 @@ def desktop_menu_diagnostics():
 
 def desktop_diagnostics():
     """Report actual defaults against the explicit native deployment choice."""
+    cli_diagnostics()
     checks = [('default web browser', ['xdg-settings', 'get', 'default-web-browser'],
                'brave-native.desktop')]
     checks += [(f'{scheme} handler', ['xdg-mime', 'query', 'default', f'x-scheme-handler/{scheme}'],

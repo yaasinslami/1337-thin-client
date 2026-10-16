@@ -424,7 +424,7 @@ sha256sum ./thin-client-setup ~/.local/bin/thin-client-setup
 ~/.local/bin/thin-client-setup defaults brave
 ```
 
-`install-self` copies only the reviewed script, using the existing managed-file
+`install-self` copies the reviewed script, using the existing managed-file
 marker, atomic replacement, executable permissions and a post-copy hash check.
 It refuses unmanaged files and symlink destinations. It works before goinfre apps
 are prepared, changes no desktop associations, and is idempotent. `desktop` still
@@ -433,6 +433,15 @@ that requirement clear. An installed script cannot discover every checkout;
 run **the checkout's** `./thin-client-setup status` after pulling. It reports the
 executing release, checkout HEAD, both SHA-256 hashes and `UPDATE REQUIRED` on a
 mismatch. SHA-256 includes uncommitted edits; checkout HEAD alone does not.
+
+`install-self`, `desktop`, and `prepare` also install the user CLI symlinks
+`~/.local/bin/code -> ~/.local/bin/code-native` and
+`~/.local/bin/brave -> ~/.local/bin/brave-native`. All arguments pass through
+the existing wrappers. Correct links are unchanged; stale links to the matching
+`~/bin/code-native` or `~/bin/brave-native` wrapper are repaired. Regular files,
+directories, and other symlinks are refused. No shell files or PATH are edited.
+Keep `~/.local/bin` before system application directories in your own PATH;
+`status` and `doctor` report link and PATH mismatches.
 
 For a friend's remaining DawnGraphiteCache error, collect these read-only facts
 before concluding that a current implementation failed:

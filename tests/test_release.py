@@ -603,14 +603,11 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_', output.getvalue())
         self.assertEqual(before, sorted(self.base.rglob('*')))
 
-    def test_codex_split_installation_deferred_without_side_effects(self):
+    def test_codex_install_dry_run_without_side_effects(self):
         before = sorted(self.base.rglob('*'))
-        for action in ['install', 'prepare']:
-            with self.subTest(action=action), \
-                 mock.patch.object(tool, 'goinfre', side_effect=AssertionError('no storage mutation')), \
-                 mock.patch.object(tool, 'run', side_effect=AssertionError('no installer')):
-                with self.assertRaisesRegex(RuntimeError, 'deferred'):
-                    tool.main(['codex', action])
+        with mock.patch.object(tool, 'goinfre', side_effect=AssertionError('no storage mutation')), \
+             mock.patch.object(tool, 'install_codex', side_effect=AssertionError('no installer')):
+            tool.main(['codex', 'install', '--dry-run'])
         self.assertEqual(before, sorted(self.base.rglob('*')))
 
 

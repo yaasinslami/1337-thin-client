@@ -103,7 +103,7 @@ class CliShimTests(unittest.TestCase):
             self.assertEqual(result.stdout, '--new-window\na b\n\n')
             self.assertEqual((directory / (app + '-native')).read_bytes(), contents)
 
-    def test_prepare_reaches_shims_without_shell_or_system_writes(self):
+    def test_prepare_reaches_shims_without_unrelated_shell_or_system_writes(self):
         sentinels = [self.home / name for name in ('.zshrc', '.bashrc', '.zsh_history')]
         sentinels += [self.base / 'system-code']
         for p in sentinels:

@@ -4,7 +4,8 @@
 
 Commands: install (download/update), migrate (copy once), integrate (launchers),
 prepare (all three), status, open brave|code [arguments]. Launchers NEVER download.
-No sudo, process killing, old-profile removal, shell/SSH edits or home fallback.
+No sudo, process killing, old-profile removal, SSH edits or home fallback.
+Optional graphical login setup uses XDG Autostart; shell startup is untouched.
 Official-download ideas adapted from shank187/session-setup (MIT); see
 README.md and THIRD_PARTY_NOTICES.md for attribution and storage details.
 """
@@ -35,7 +36,7 @@ OLD_BRAVE = HOME / '.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browse
 OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
 STATE = HOME / '.local/share/thin-client'
 SELF = HOME / '.local/bin/thin-client-setup'
-VERSION = '0.3.0'
+VERSION = '0.4.0'
 BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS = (
     Path('Cache'), Path('Code Cache'), Path('GPUCache'),
     Path('DawnGraphiteCache'), Path('DawnWebGPUCache'),
@@ -817,12 +818,14 @@ def install_self():
     safe(SELF)
     cli_shim_plan()
     if source == SELF.resolve():
+        refresh_session_entry()
         install_cli_shims()
         return
     safe(SELF.parent).mkdir(parents=True, exist_ok=True)
     managed_file(SELF, source.read_text(), 0o755)
     if digest(source) != digest(SELF):
         raise RuntimeError('Installed script differs after update; inspect before proceeding')
+    refresh_session_entry()
     install_cli_shims()
     print(f'Installed setup {VERSION}: {SELF}; SHA-256 {digest(SELF)}', flush=True)
 
@@ -926,20 +929,307 @@ def make_default_browser():
         raise RuntimeError('Desktop defaults did not match after registration; see diagnostics above')
     print('Explicit choice applied: native Brave is the HTTP/HTTPS default', flush=True)
 
+def codex_paths(root):
+    return root.parent / 'codex-storage', root.parent / 'codex-bin'
+
+
+def codex_installed(root):
+    if root is None:
+        return False
+    storage, launchers = codex_paths(root)
+    binary = launchers / 'codex'
+    return (binary.is_symlink() and
+            binary.resolve().is_relative_to(storage / 'packages/standalone/releases') and
+            os.access(binary, os.X_OK))
+
+
 def codex_status(root):
-    """Metadata only. Do not execute Codex, read credentials, or migrate state."""
-    codex_home = Path(os.environ.get('CODEX_HOME', str(HOME / '.codex')))
-    print(f'Codex command: {shutil.which("codex") or "not on PATH"}', flush=True)
-    print(f'Codex state root: {codex_home}', flush=True)
-    for name, kind in [('config.toml', 'configuration'), ('auth.json', 'file credentials (optional)'),
-                       ('sessions', 'session state'), ('history.jsonl', 'history'),
-                       ('packages', 'managed executable packages'), ('plugins', 'plugin resources/state'),
-                       ('skills', 'skills')]:
-        print(f'{name}: {"present" if (codex_home / name).exists() else "absent"}; {kind}', flush=True)
-    print('Codex split installation is not implemented: CODEX_HOME selects the entire state root; '
-          'CODEX_INSTALL_DIR changes only the visible command location, not the standalone package cache. '
-          f'A wholly disposable state root could be {root / "codex-home"}, but auth, sessions, '
-          'config and skills there would also be lost on a new post. See README.', flush=True)
+    """Metadata only; never execute Codex or open credentials/databases."""
+    state = Path(os.environ.get('CODEX_HOME', str(HOME / '.codex')))
+    print(f'Codex: {"installed" if codex_installed(root) else "not installed on this post"}')
+    print(f'Codex command: {shutil.which("codex") or "not on PATH"}')
+    print(f'Codex state root: {state}')
+    for name in ('auth.json', 'config.toml', 'sessions'):
+        print(f'{name}: {"present" if (state / name).exists() else "absent"}')
+    if root is not None:
+        storage, launchers = codex_paths(root)
+        print(f'Codex package root: {storage}; launcher: {launchers / "codex"}')
+
+
+def install_codex(root):
+    """Explicit installer-only state root. The installer cannot see the real HOME."""
+    validate_goinfre(root.parent, HOME)
+    storage, launchers = codex_paths(root)
+    package = storage / 'packages/standalone'
+    for path in (storage, storage / 'packages', package, package / 'releases', launchers):
+        safe(path)
+        if path.exists() and not path.is_dir():
+            raise RuntimeError(f'Expected Codex directory: {path}')
+    for path in (package / 'current', launchers / 'codex', launchers / 'codex-code-mode-host'):
+        if path.is_symlink():
+            if not path.resolve().is_relative_to(package / 'releases'):
+                raise RuntimeError(f'Unrelated Codex symlink, left intact: {path}')
+        elif path.exists():
+            raise RuntimeError(f'Unrecognized Codex path, left intact: {path}')
+    safe(storage).mkdir(parents=True, exist_ok=True)
+    safe(launchers).mkdir(parents=True, exist_ok=True)
+    with safe(storage / '.thin-client-install.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if codex_installed(root):
+            print('Codex machine-local package already installed; no update or state changes.')
+            return
+        with tempfile.TemporaryDirectory(prefix='.installer-', dir=storage) as work:
+            work = Path(work)
+            installer = work / 'install.sh'
+            run(['curl', '-fL', '--proto', '=https', '--proto-redir', '=https',
+                 '--connect-timeout', '20', '--max-time', '120',
+                 '-o', installer, 'https://chatgpt.com/codex/install.sh'])
+            isolated_home = work / 'home'
+            isolated_home.mkdir()
+            # Do not inherit daemon-only/updater flags or an existing runtime CODEX_HOME.
+            env = {key: value for key, value in os.environ.items() if not key.startswith('CODEX_')}
+            env.update(HOME=str(isolated_home), CODEX_HOME=str(storage),
+                       CODEX_INSTALL_DIR=str(launchers), CODEX_NON_INTERACTIVE='1',
+                       PATH=f'{launchers}:/usr/local/bin:/usr/bin:/bin', TMPDIR=str(work),
+                       XDG_CONFIG_HOME=str(isolated_home / 'config'),
+                       XDG_CACHE_HOME=str(work / 'cache'), XDG_DATA_HOME=str(isolated_home / 'data'))
+            run(['sh', installer], env=env, stdin=subprocess.DEVNULL)
+        if not codex_installed(root):
+            raise RuntimeError('Installer finished without a valid goinfre Codex launcher')
+    codex_status(root)
+
+
+SESSION_LOG_LIMIT = 4096
+SESSION_RETRY_SECONDS = 300
+SESSION_NAME = '1337 Thin Client Session'
+
+
+def session_entry():
+    return HOME / '.config/autostart/1337-thin-client.desktop'
+
+
+def session_entry_contents():
+    # Desktop Exec quoting is not shell quoting. Escape reserved characters in
+    # the absolute executable, and escape literal percent field-code markers.
+    if any(char in str(SELF) for char in ('\n', '\r', '=')):
+        raise RuntimeError('Installed script path cannot be represented safely in desktop Exec')
+    executable = str(SELF).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
+    executable = executable.replace('%', '%%').replace('\\', '\\\\')
+    return ('[Desktop Entry]\n# Managed by thin-client-setup\nType=Application\n'
+            f'Name={SESSION_NAME}\n'
+            'Comment=Initialize the 1337 thin-client environment for this workstation\n'
+            f'Exec="{executable}" session-init\n'
+            'Terminal=false\nNoDisplay=true\nStartupNotify=false\n'
+            'X-GNOME-Autostart-enabled=true\n')
+
+
+def owned_session_entry(path):
+    return (path.is_file() and not path.is_symlink() and
+            '# Managed by thin-client-setup' in path.read_text().splitlines() and
+            desktop_fields(path).get('Name') == SESSION_NAME)
+
+
+def session_enable():
+    path = safe(session_entry())
+    if path.exists() and not owned_session_entry(path):
+        raise RuntimeError(f'Refusing unrelated autostart entry: {path}')
+    safe(path.parent).mkdir(parents=True, exist_ok=True)
+    managed_file(path, session_entry_contents(), 0o644)
+    print('Thin-client graphical session autostart enabled.')
+
+
+def session_disable():
+    path = safe(session_entry())
+    if path.exists():
+        if not owned_session_entry(path):
+            raise RuntimeError(f'Refusing unrelated autostart entry: {path}')
+        path.unlink()
+    print('Thin-client graphical session autostart disabled.')
+
+
+def refresh_session_entry():
+    """Upgrade existing opt-in integration; never create it or undo disablement."""
+    path = session_entry()
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        safe(path)
+        if not owned_session_entry(path):
+            return
+        fields = desktop_fields(path)
+        if fields.get('Hidden') == 'true' or fields.get('X-GNOME-Autostart-enabled') == 'false':
+            return
+        managed_file(path, session_entry_contents(), 0o644)
+    except (OSError, RuntimeError, UnicodeError, configparser.Error):
+        print('Session autostart update skipped; inspect thin-client-setup session status.')
+
+
+def remove_legacy_zsh_trigger():
+    """One-time maintenance helper; never called by any normal CLI workflow."""
+    path = safe(HOME / '.zshrc')
+    if not path.exists():
+        return
+    before = path.read_bytes()
+    begin = b'# >>> 1337 thin-client session >>>'
+    end = b'# <<< 1337 thin-client session <<<'
+    if begin not in before and end not in before:
+        return
+    candidates = [(begin + b'\n'
+                   b'if [[ -o interactive ]] && command -v thin-client-setup >/dev/null; then\n'
+                   b'    thin-client-setup session-init' + guard + b'\n'
+                   b'fi\n' + end + b'\n') for guard in (b' || :', b'')]
+    match = next((block for block in candidates if before.count(block) == 1), None)
+    if (match is None or before.count(begin) != 1 or before.count(end) != 1 or
+            (before.index(match) and before[before.index(match) - 1:before.index(match)] != b'\n')):
+        raise RuntimeError('Unrecognized legacy zsh session block; left intact')
+    after = before.replace(match, b'', 1)
+    fd, temporary = tempfile.mkstemp(prefix='.zshrc-thin-client-', dir=HOME)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(after)
+        os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    print('Removed only the exact legacy zsh session trigger.')
+
+
+def core_ready(root):
+    return (all(os.access(root / p, os.X_OK) for p in
+                ('apps/brave/current/brave', 'apps/vscode/current/bin/code')) and
+            all(p.is_file() for p in (BRAVE / '.thin-client-import', CODE / '.thin-client-import',
+                                     HOME / '.local/bin/brave-native', HOME / '.local/bin/code-native')) and
+            all((root / p).is_dir() for p in
+                ('vscode-extensions', 'runtime/brave/config', 'runtime/brave/cache')))
+
+
+def read_session_log(root):
+    path = safe(root / 'runtime/session-init.log')
+    if not path.exists():
+        return {}
+    if not path.is_file():
+        raise RuntimeError('Expected a regular session log')
+    with path.open('rb') as stream:
+        data = stream.read(SESSION_LOG_LIMIT + 1)
+    if len(data) > SESSION_LOG_LIMIT:
+        return {}
+    try:
+        value = json.loads(data)
+        return value if isinstance(value, dict) else {}
+    except (ValueError, UnicodeError):
+        return {}
+
+
+def write_session_log(runtime, record):
+    """Only fixed metadata, atomically replaced each run; never child output."""
+    path = safe(runtime / 'session-init.log')
+    data = (json.dumps(record, indent=2) + '\n').encode()
+    if len(data) > SESSION_LOG_LIMIT:
+        raise RuntimeError('Session log exceeds its fixed bound')
+    fd, temporary = tempfile.mkstemp(prefix='.session-init-', dir=runtime)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def session_status():
+    print('1337 session')
+    path = session_entry()
+    try:
+        safe(path)
+        if not path.exists():
+            state = 'disabled'
+        elif not owned_session_entry(path):
+            state = 'MISMATCH: unrecognized entry'
+        elif (desktop_fields(path).get('Hidden') == 'true' or
+              desktop_fields(path).get('X-GNOME-Autostart-enabled') == 'false'):
+            state = 'disabled'
+        else:
+            state = 'enabled' if path.read_text() == session_entry_contents() else 'MISMATCH: run session enable'
+    except (OSError, RuntimeError, UnicodeError, configparser.Error):
+        state = 'MISMATCH: unsafe or unreadable entry'
+    print(f'  Autostart {state}')
+    try:
+        root = goinfre()
+    except (OSError, RuntimeError):
+        root = None
+    print(f'  Core     {"ready" if root is not None and core_ready(root) else "not prepared"}')
+    for label, relative in (('Brave', 'apps/brave/current/brave'), ('Code', 'apps/vscode/current/bin/code')):
+        ready = root is not None and os.access(root / relative, os.X_OK)
+        print(f'  {label:8} {"ready" if ready else "not prepared"}')
+    print(f'  Codex    {"installed" if codex_installed(root) else "not installed on this post"}')
+    try:
+        usage = shutil.disk_usage(HOME)
+        print(f'  HOME fs  {usage.free / 2**30:.1f}G free / {usage.total / 2**30:.1f}G')
+    except OSError:
+        print('  HOME fs  unavailable')
+    try:
+        last = read_session_log(root).get('result', 'not run') if root is not None else 'not run'
+    except (OSError, RuntimeError):
+        last = 'unavailable'
+    if last not in ('success', 'failed', 'running', 'not run', 'unavailable'):
+        last = 'unrecognized record'
+    print(f'  Last init {"successful" if last == "success" else last}')
+
+
+def session_init():
+    """Silent ready path; autostart is an independent child, returning 1 on failure."""
+    runtime, record = None, {'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    try:
+        root = goinfre()
+        ready = core_ready(root)  # Only local artifacts; no version/update checks.
+        runtime = safe(root / 'runtime')
+        runtime.mkdir(parents=True, exist_ok=True)
+        lock_path = safe(runtime / 'session-init.lock')
+        if lock_path.exists() and not lock_path.is_file():
+            raise RuntimeError('Expected a regular session lock')
+        with lock_path.open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 0  # Do not overwrite the active initializer's log.
+            ready = core_ready(root)  # Recheck actual artifacts after acquiring the lock.
+            record['core'] = 'ready' if ready else 'new/unprepared post'
+            record['prepare_started'] = False
+            if not ready:
+                previous = read_session_log(root)
+                now = time.time()
+                attempted = previous.get('attempted_at')
+                if (previous.get('result') == 'failed' and isinstance(attempted, (int, float)) and
+                        0 <= now - attempted < SESSION_RETRY_SECONDS):
+                    record.update(result='failed', attempted_at=attempted,
+                                  error='recent preparation failed; retry later or run prepare manually')
+                    write_session_log(runtime, record)
+                    print('Thin-client session setup recently failed; run thin-client-setup prepare for details.', file=sys.stderr)
+                    return 1
+                record.update(prepare_started=True, attempted_at=now, result='running')
+                write_session_log(runtime, record)
+                # No child output is stored: it can contain browser/profile paths.
+                # Inherit the lock so a killed parent cannot start a second prepare
+                # while the original child is still running.
+                result = subprocess.run([sys.executable, str(Path(__file__).resolve()), 'prepare'],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        pass_fds=(lock.fileno(),), check=False)
+                record['prepare_exit'] = result.returncode
+                ready = result.returncode == 0 and core_ready(root)
+            record['result'] = 'success' if ready else 'failed'
+            write_session_log(runtime, record)
+            if not ready:
+                print('Thin-client session setup failed; run thin-client-setup prepare for details.', file=sys.stderr)
+            return 0 if ready else 1
+    except (OSError, RuntimeError, ValueError) as error:
+        record.update(result='failed', error=type(error).__name__)
+        if runtime is not None:
+            try:
+                write_session_log(runtime, record)
+            except (OSError, RuntimeError):
+                pass
+        print('Thin-client session setup unavailable; run thin-client-setup session status.', file=sys.stderr)
+        return 1
+
 
 def flatpak_path(app):
     if app not in APP_IDS:
@@ -1038,8 +1328,12 @@ def cli_parser():
     sub = subs.add_parser('defaults', help='Explicitly register the native browser and Code callback')
     sub.add_argument('browser', choices=['brave'])
     sub.add_argument('--dry-run', action='store_true')
-    sub = subs.add_parser('codex', help='Inspect Codex storage; safe persistent/package split is deferred')
-    sub.add_argument('action', choices=['status', 'install', 'prepare'])
+    subs.add_parser('session-init', help='Graphical login initializer; bootstrap only missing core applications')
+    sub = subs.add_parser('session', help='Opt-in XDG Autostart and read-only session diagnostics')
+    sub.add_argument('action', choices=['enable', 'disable', 'status', 'run'],
+                     help='enable/disable autostart, inspect status, or run initialization manually')
+    sub = subs.add_parser('codex', help='Explicit optional standalone installation or read-only status')
+    sub.add_argument('action', choices=['status', 'install'])
     sub.add_argument('--dry-run', action='store_true')
     sub = subs.add_parser('open')
     sub.add_argument('app', choices=['brave', 'code'])
@@ -1070,10 +1364,26 @@ def main(argv=None):
     if command == 'status':
         script_status()
         desktop_diagnostics()
-    if command == 'codex' and options.action != 'status':
-        raise RuntimeError('Codex install/prepare is deferred: no supported independent heavy-package '
-                           'root was established for persistent CODEX_HOME. No files changed. '
-                           'See README for supported alternatives; codex status is read-only.')
+    if command == 'session-init':
+        return session_init()
+    if command == 'session':
+        if options.action == 'run':
+            return session_init()
+        {'enable': session_enable, 'disable': session_disable, 'status': session_status}[options.action]()
+        return
+    if command == 'codex':
+        if options.dry_run:
+            print(f'DRY RUN: codex {options.action}; no files or persistent state changed')
+            return
+        if options.action == 'status':
+            try:
+                root = goinfre()
+            except RuntimeError:
+                root = None
+            codex_status(root)
+        else:
+            install_codex(goinfre())
+        return
     root = goinfre()
     print(f'Goinfre: {root}\nBrave persistent profile: {BRAVE}\nVS Code persistent state: {CODE}', flush=True)
     if command == 'status':
@@ -1083,9 +1393,6 @@ def main(argv=None):
                    ['apps/brave/current/brave', 'apps/vscode/current/bin/code']):
             print('New/unprepared workstation detected. Run: ~/.local/bin/thin-client-setup prepare '
                   '(after quitting applications). No downloads were started.', flush=True)
-        return
-    if command == 'codex':
-        codex_status(root)
         return
     if getattr(options, 'dry_run', False):
         if command == 'retire-flatpak':
@@ -1120,7 +1427,7 @@ def main(argv=None):
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main() or 0)
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError, zipfile.BadZipFile, tarfile.TarError) as e:
         print(f'STOPPED: {e}', file=sys.stderr)
         sys.exit(1)

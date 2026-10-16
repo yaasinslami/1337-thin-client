@@ -7,6 +7,27 @@ preserving personal browser data and editor preferences in **HOME**.
 Inspired by [shank187/session-setup](https://github.com/shank187/session-setup).
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
 
+## Quick start
+
+First setup, after reviewing the repository:
+
+```sh
+./thin-client-setup install-self
+thin-client-setup prepare
+thin-client-setup defaults brave
+```
+
+Optional automatic core bootstrap at graphical login:
+
+```sh
+thin-client-setup session enable
+thin-client-setup session status
+# Disable later: thin-client-setup session disable
+```
+
+Optional Codex installation is separate: `thin-client-setup codex install`.
+Neither optional feature changes the core Brave + Code definition.
+
 ## Why
 
 A browser profile, Flatpak caches, extensions and development dependencies can
@@ -94,7 +115,7 @@ python3 -B -m unittest discover -s tests -v
 ```
 
 The remote placeholder must be replaced with your approved repository URL.
-There is no remote shell installer and no `curl | bash` workflow.
+Core setup uses reviewed downloads rather than a remote shell installer. Only the explicit optional Codex command runs the official standalone installer.
 
 Storage detection checks `$GOINFRE` first, then `~/goinfre`, then
 `/goinfre/<HOME-directory-basename>`. Explicit invalid overrides fail clearly.
@@ -184,8 +205,9 @@ Or use **Brave (native thin client)** and **VS Code (native thin client)** in th
 app menu. Launchers never download code. If goinfre was cleared, explicitly rerun
 `~/.local/bin/thin-client-setup prepare` to restore reproducible app files.
 
-No shell startup file is changed. Use full launcher paths, or add the personal
-bin directory to PATH yourself after review.
+`install-self` never adds shell startup commands or enables autostart. Use full
+launcher paths, or add the personal bin directory to PATH yourself after review;
+PATH is never edited automatically.
 
 The normal Code desktop entry opens files with `%F`. A separate hidden
 `code-native-url-handler.desktop` calls the native wrapper with `--open-url %U`
@@ -439,7 +461,8 @@ mismatch. SHA-256 includes uncommitted edits; checkout HEAD alone does not.
 `~/.local/bin/brave -> ~/.local/bin/brave-native`. All arguments pass through
 the existing wrappers. Correct links are unchanged; stale links to the matching
 `~/bin/code-native` or `~/bin/brave-native` wrapper are repaired. Regular files,
-directories, and other symlinks are refused. No shell files or PATH are edited.
+directories, and other symlinks are refused. CLI shim handling edits no shell files
+or PATH. Graphical session autostart is a separate explicit opt-in below.
 Keep `~/.local/bin` before system application directories in your own PATH;
 `status` and `doctor` report link and PATH mismatches.
 
@@ -480,54 +503,125 @@ Temporary legacy backups are reference/recovery copies, not database fragments
 to merge into an active profile. Before retirement, old Flatpak launchers remain
 an independent fallback; new native changes are not synced back to them.
 
-## Optional Codex storage: investigation and safe alternatives
+## Optional graphical login bootstrap
 
-The requested automatic persistent-state/disposable-package split is **deferred**.
-This release adds a read-only storage diagnostic, without executing Codex:
+Enable [standard XDG Autostart](https://specifications.freedesktop.org/autostart/latest/)
+explicitly if you want automatic core preparation when logging into a school post:
 
 ```sh
-~/.local/bin/thin-client-setup codex status
+thin-client-setup session enable
+thin-client-setup session status
+thin-client-setup session run       # Manually invoke the same initializer
+thin-client-setup session disable
 ```
 
-`codex install` and `codex prepare` deliberately refuse without downloading,
-moving data or creating wrappers. Normal Brave/Code preparation never installs
-Codex. Existing Codex installations, auth, config and databases remain untouched.
+`session enable` writes the managed
+`~/.config/autostart/1337-thin-client.desktop`. Its `Exec` uses the absolute
+persistent `~/.local/bin/thin-client-setup session-init` path, quoted for desktop
+entry syntax. It requires no interactive shell, user systemd service or sudo.
+`Terminal=false` and `NoDisplay=true` keep it out of normal application menus.
+Disabling removes only this managed entry; other autostart entries are untouched.
+Unknown files or symlink destinations at that path are refused.
 
-Current [official environment-variable documentation](https://learn.chatgpt.com/docs/config-file/environment-variables)
-defines `CODEX_HOME` as the entire Codex state root, including config, auth,
-sessions, logs, skills and standalone package metadata. It must already exist.
-`CODEX_INSTALL_DIR` changes the visible command location; standalone packages
-still live under `CODEX_HOME/packages/standalone`. These are separate concerns.
-The local 0.161.0 layout is not a portable specification of future releases.
+Neither `install-self` nor core `prepare` enables autostart for a new user.
+Script upgrades refresh an existing enabled managed entry while preserving an
+explicitly removed/disabled entry. Shell files and history are untouched by
+normal commands. The earlier uncommitted zsh trigger is retired; there is no
+shell startup integration or automatic terminal status display.
 
-| Category | Persistence decision |
-| --- | --- |
-| Standalone executables and app-server packages | Reproducible payloads; no independent root for all managed packages was established in current official configuration |
-| Downloads, generated caches and plugin package resources | Often reproducible, but not a supported single disposable subtree |
-| Config and authentication | Persistent/sensitive; credentials may use files or the OS keyring |
-| Sessions, history and SQLite-backed runtime state | User state; never blindly moved or marked disposable |
-| User skills and plugin configuration | May be user-authored/persistent; plugin resources can mix reproducible and user state |
+At graphical login, `session-init` first checks real machine-local Brave/Code
+binaries and core profile/launcher/runtime/extension artifacts. Persistent HOME
+markers or stale success records alone cannot establish readiness on a new post.
+On a ready post it exits silently, performs no version/update checks, network
+requests, package installation, doctor checks or recursive HOME scans.
 
-The [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
-documents `sqlite_home` and `log_dir`, but they do not supply a root for all heavy
-packages. No selective package/daemon/plugin symlink scheme is implemented:
-its safety across installers, self-updates and new posts has not been established.
-The diagnostic reports presence of known paths only; it never prints auth/config
-contents or opens databases.
+On an unprepared post it invokes the existing **core-only** `prepare` once under
+a nonblocking goinfre lock. Concurrent invocations return immediately. The
+preparation child inherits the lock so it stays held if the initializer dies;
+the OS releases locks when their last holder exits. Lock files may remain without
+locking anything. No marker can permanently prevent recovery.
 
-Supported alternatives have explicit tradeoffs:
+Failures return nonzero from the separate autostart child and leave the desktop
+session running. There is no retry loop. A recent failed attempt suppresses
+repeated preparation for five minutes; after that a new invocation can retry.
+Run `thin-client-setup prepare` manually for detailed failure output or immediate
+recovery. Once actual artifacts are ready, the fast path ignores earlier failures.
+Existing applications must be stopped if preparation needs to activate updates;
+the initializer never kills applications or logs out the user.
 
-- Keep the normal persistent `CODEX_HOME` in HOME, with an independently installed
-  CLI executable/package in goinfre. This moves that executable only and does not
-  guarantee that managed daemon/plugin packages or sessions stop growing in HOME.
-- Put an independent **whole** `CODEX_HOME` in detected goinfre. This reduces HOME
-  usage but makes auth, config, sessions, skills and packages disposable together.
-  A new post needs a new install and login; it does not meet the requested
-  persistent-state requirement. The repo does not silently select this mode.
-- Run Codex on a persistent remote machine, using local native Code over SSH.
+The latest run is recorded in
+`~/goinfre/thin-client/runtime/session-init.log`, atomically replaced and bounded
+to 4 KiB. It contains only timestamp, readiness, whether preparation started, its
+exit code and the result/error class. Child output, browser profile details,
+auth state, environment variables and secrets are never copied into this log.
+Use `thin-client-setup session status` for a compact read-only summary:
 
-Until a supported full split is established, this repository does not promise
-both a tiny local Codex HOME and workstation-independent persistent Codex state.
+```text
+1337 session
+  Autostart enabled
+  Core     ready
+  Brave    ready
+  Code     ready
+  Codex    installed
+  HOME fs  3.5G free / 4.6G
+  Last init successful
+```
+
+HOME fs is filesystem free space/capacity, **not an account quota or HOME size**;
+it uses filesystem metadata, not `du`. Codex readiness is informational only.
+Automatic preparation installs only Brave, Code, Remote SSH essentials, native
+icons/launchers/CLI shims, the Code URI handler and reviewed runtime/cache paths.
+It never installs Codex, Spotify, Claude, pyenv, personal extensions or themes.
+
+## Optional standalone Codex
+
+Codex installation requires an explicit command; neither core `prepare` nor
+`session-init` calls it:
+
+```sh
+thin-client-setup codex status
+thin-client-setup codex install --dry-run
+thin-client-setup codex install
+~/goinfre/codex-bin/codex --version
+```
+
+The command downloads and executes the
+[official standalone installer](https://chatgpt.com/codex/install.sh), which
+verifies its release checksums. Only that installer process receives:
+
+```text
+CODEX_HOME=<validated goinfre>/codex-storage
+CODEX_INSTALL_DIR=<validated goinfre>/codex-bin
+```
+
+Heavy standalone payloads land in `codex-storage/packages/standalone`; launchers
+land in `codex-bin`. Installation is idempotent for an existing valid launcher;
+missing/broken managed launchers can be repaired by repeating `codex install`.
+Unknown launcher files, symlinks outside the standalone release tree, symlinked
+storage ancestors and HOME-backed storage are refused rather than overwritten.
+The installer runs noninteractively with a temporary HOME in goinfre, isolated
+XDG directories and process-local PATH, preventing its own shell integration
+from touching the real account. Existing independent Codex installations are
+never removed. No Codex launcher is overwritten in `~/.local/bin`.
+
+Use `~/goinfre/codex-bin/codex` directly, or put `~/goinfre/codex-bin` on your PATH
+manually if desired. The tool does not persist PATH or `CODEX_HOME` exports.
+When running normally, an unset `CODEX_HOME` stays unset, so Codex uses
+`~/.codex`; an existing user override is respected. Auth, config, sessions and
+other persistent Codex state are never migrated, deleted or rewritten by setup.
+
+[Official environment-variable documentation](https://learn.chatgpt.com/docs/config-file/environment-variables)
+defines `CODEX_HOME` as the **whole state root**, not a binary-only storage switch.
+This school-workstation integration is CLI-only: it does not start, configure,
+repair or depend on a daemon. Daemon-backed features may separately require a
+standalone package under the active runtime `CODEX_HOME`; setup never relocates
+persistent state or creates package symlinks to satisfy that. This is not a
+supported split of all plugin/daemon resources, which may still grow runtime state.
+
+After switching posts, `codex status` reports the machine-local package missing
+without changing `~/.codex`. Only another explicit `codex install` recreates it.
+Installer dependencies (curl, tar, checksum tools and standard Unix utilities)
+are optional Codex requirements, not requirements for core session readiness.
 
 ## Troubleshooting
 
@@ -557,8 +651,9 @@ retirement paths, JSONC, fresh accounts and read-only dry runs. Release tests ru
 the real self-install command in a temporary HOME, load that installed copy for
 the friend's Brave-cache scenario, exercise the generated callback wrapper, and
 simulate XDG defaults, cross-filesystem backups and empty-post recovery. External
-auth and Codex installers are not executed. Development never applies setup to
-the developer's live HOME.
+auth and real Codex installers are not executed in tests. Codex boundary tests run
+a harmless installer fixture in temporary storage. Live deployment is separate
+and requires explicit user authorization after tests pass.
 
 Do not add real profiles, audit dumps, auth files, SSH material or legacy backups.
 The repository ignores common generated/personal artifacts. Review every staged

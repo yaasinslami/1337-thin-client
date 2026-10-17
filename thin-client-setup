@@ -6,8 +6,7 @@ Commands: install (download/update), migrate (copy once), integrate (launchers),
 prepare (all three), status, open brave|code [arguments]. Launchers NEVER download.
 No sudo, process killing, old-profile removal, SSH edits or home fallback.
 Optional graphical login setup uses XDG Autostart; shell startup is untouched.
-Official-download ideas adapted from shank187/session-setup (MIT); see
-README.md and THIRD_PARTY_NOTICES.md for attribution and storage details.
+See README.md for storage details and LICENSE for licensing terms.
 """
 import argparse
 import configparser

@@ -1,11 +1,10 @@
 # 1337 Thin Client
 
+Created and maintained by Yassine Slami.
+
 Native Brave and VS Code for a Linux 42/1337 workstation with a small HOME
 filesystem. Keep reproducible applications and caches in **goinfre** while
 preserving personal browser data and editor preferences in **HOME**.
-
-Inspired by [shank187/session-setup](https://github.com/shank187/session-setup).
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
 
 ## Quick start
 

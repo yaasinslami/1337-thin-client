@@ -63,7 +63,7 @@ class BraveRuntimeTests(unittest.TestCase):
         (old / 'persistent').write_bytes(b'old worker state')
         with self.fake_mount(), mock.patch.object(tool, 'goinfre', return_value=self.root), \
              mock.patch.object(tool, 'stopped'), mock.patch.object(tool, 'install_self'), \
-             mock.patch.object(tool, 'install'), mock.patch.object(tool, 'run'), \
+             mock.patch.object(tool, 'install', side_effect=fixtures.staged_install), mock.patch.object(tool, 'activate_release'), mock.patch.object(tool, 'run'), \
              mock.patch.object(tool, 'desktop_integration'):
             for _ in range(2):
                 tool.main(['prepare'])

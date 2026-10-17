@@ -21,6 +21,20 @@ tool = importlib.util.module_from_spec(spec)
 loader.exec_module(tool)
 
 
+def staged_install(root, app, *, activate=False):
+    """Fixture payload already placed at current; activation is mocked separately."""
+    executable = root / ('apps/brave/current/brave' if app == 'brave' else 'apps/vscode/current/bin/code')
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    if not executable.exists():
+        executable.write_text('fixture')
+        executable.chmod(0o755)
+    wrapper = tool.HOME / '.local/bin' / (app + '-native')
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(tool.native_wrapper_contents(app))
+    wrapper.chmod(0o755)
+    return (root / 'apps' / ('brave' if app == 'brave' else 'vscode') / 'current').resolve()
+
+
 class SafetyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -419,7 +433,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_prepare_idempotent_and_recreates_lost_cache_targets(self):
         with mock.patch.object(tool, 'goinfre', return_value=self.root), \
-             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'install'), \
+             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'install', side_effect=staged_install), mock.patch.object(tool, 'activate_release'), \
              mock.patch.object(tool, 'stopped'), mock.patch.object(tool, 'run'), \
              mock.patch.object(tool, 'desktop_integration'):
             tool.main(['prepare'])
@@ -561,8 +575,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_prepare_never_implicitly_sets_browser_default(self):
         with mock.patch.object(tool, 'goinfre', return_value=self.root), \
-             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'install'), \
-             mock.patch.object(tool, 'migrate'), mock.patch.object(tool, 'integrate'), \
+             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'prepare_core'), \
              mock.patch.object(tool, 'make_default_browser') as default:
             tool.main(['prepare'])
             default.assert_not_called()

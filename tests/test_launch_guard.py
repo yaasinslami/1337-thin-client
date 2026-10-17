@@ -24,7 +24,14 @@ class LaunchGuardTests(unittest.TestCase):
     def ready(self, app):
         self.native_fixture(app)
         tool.environment(self.root, 'brave' if app == 'brave' else 'vscode')
-        (self.root / ('cache/brave-profile' if app == 'brave' else 'cache/vscode')).mkdir(parents=True, exist_ok=True)
+        (tool.brave_caches if app == 'brave' else tool.vscode_caches)(self.root)
+        wrapper = self.home / '.local/bin' / (app + '-native')
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text(tool.native_wrapper_contents(app))
+        wrapper.chmod(0o755)
+        current = self.root / 'apps' / ('brave' if app == 'brave' else 'vscode') / 'current'
+        tool.app_progress(self.root, app, result='success', phase='ready',
+                          critical_incomplete=False, integrated_release=str(current.resolve()))
 
     def test_ready_app_launches_without_wait_notification_or_network(self):
         for app, args in [('code', ['.', '--new-window', 'a b']), ('brave', ['--incognito'])]:
@@ -63,31 +70,31 @@ class LaunchGuardTests(unittest.TestCase):
     def test_wait_success_checks_existing_lock_result_and_app_artifacts(self):
         for app in ('brave', 'code'):
             self.ready(app)
-            with tool.session_lock_path(self.root).open('a') as prepare:
+            with tool.app_lock_path(self.root, app).open('a+') as prepare:
                 fcntl.flock(prepare, fcntl.LOCK_EX)
                 def finish(_):
-                    tool.write_session_log(self.root / 'runtime', {'result': 'success'})
+                    tool.app_progress(self.root, app, result='success', critical_incomplete=False)
                     fcntl.flock(prepare, fcntl.LOCK_UN)
                 with mock.patch.object(tool.time, 'sleep', side_effect=finish), \
                      mock.patch.object(tool, 'launch_notice') as notify, \
                      mock.patch.object(tool.os, 'execve') as launch:
                     tool.open_app(self.root, app, [])
                 launch.assert_called_once()
-                self.assertIn('still being prepared', notify.call_args.args[0])
+                self.assertIn('is being prepared', notify.call_args.args[0])
                 self.assertIn('Brave' if app == 'brave' else 'VS Code', notify.call_args.args[0])
 
-    def test_failed_missing_or_running_receipt_refuses_even_if_binary_exists(self):
+    def test_incomplete_app_critical_state_refuses_even_if_binary_exists(self):
         self.ready('brave')
         for result in ('failed', 'running', None):
-            with self.subTest(result=result), tool.session_lock_path(self.root).open('a') as prepare:
+            with self.subTest(result=result), tool.app_lock_path(self.root, 'brave').open('a+') as prepare:
                 fcntl.flock(prepare, fcntl.LOCK_EX)
                 def finish(_):
-                    tool.write_session_log(self.root / 'runtime', {'result': result})
+                    tool.app_progress(self.root, 'brave', result=result, critical_incomplete=True)
                     fcntl.flock(prepare, fcntl.LOCK_UN)
                 with mock.patch.object(tool.time, 'sleep', side_effect=finish), \
                      mock.patch.object(tool, 'launch_notice') as notify, \
                      mock.patch.object(tool.os, 'execve') as launch, \
-                     self.assertRaisesRegex(RuntimeError, 'preparation failed'):
+                     self.assertRaisesRegex(RuntimeError, 'not ready'):
                     tool.open_app(self.root, 'brave', [])
                 launch.assert_not_called()
                 self.assertIn('session status', notify.call_args.args[0])
@@ -95,33 +102,33 @@ class LaunchGuardTests(unittest.TestCase):
     def test_success_receipt_without_requested_app_runtime_refuses(self):
         self.ready('code')
         (self.root / 'vscode-extensions').rmdir()
-        with tool.session_lock_path(self.root).open('a') as prepare:
+        with tool.app_lock_path(self.root, 'code').open('a+') as prepare:
             fcntl.flock(prepare, fcntl.LOCK_EX)
             def finish(_):
-                tool.write_session_log(self.root / 'runtime', {'result': 'success'})
+                tool.app_progress(self.root, 'code', result='success', critical_incomplete=False)
                 fcntl.flock(prepare, fcntl.LOCK_UN)
             with mock.patch.object(tool.time, 'sleep', side_effect=finish), \
                  mock.patch.object(tool, 'launch_notice'), \
                  mock.patch.object(tool.os, 'execve') as launch, \
-                 self.assertRaisesRegex(RuntimeError, 'preparation failed'):
+                 self.assertRaisesRegex(RuntimeError, 'not ready'):
                 tool.open_app(self.root, 'code', [])
             launch.assert_not_called()
             self.assertFalse((self.root / 'vscode-extensions').exists())
 
     def test_already_failed_partial_prepare_is_not_blindly_launched(self):
         self.native_fixture('brave')
-        path = tool.session_lock_path(self.root)
-        tool.write_session_log(path.parent, {'result': 'failed'})
+        path = tool.app_lock_path(self.root, 'brave')
+        tool.app_progress(self.root, 'brave', result='failed', critical_incomplete=True)
         with mock.patch.object(tool, 'launch_notice'), \
              mock.patch.object(tool.os, 'execve') as launch, \
-             self.assertRaisesRegex(RuntimeError, 'preparation failed'):
+             self.assertRaisesRegex(RuntimeError, 'not ready'):
             tool.open_app(self.root, 'brave', [])
         launch.assert_not_called()
         self.assertFalse((self.root / 'runtime/brave').exists())
 
     def test_timeout_bounded_does_not_launch_or_start_second_prepare(self):
         self.ready('brave')
-        with tool.session_lock_path(self.root).open('a') as prepare:
+        with tool.app_lock_path(self.root, 'brave').open('a+') as prepare:
             fcntl.flock(prepare, fcntl.LOCK_EX)
             start = time.monotonic()
             with mock.patch.object(tool, 'LAUNCH_WAIT_SECONDS', 0.04), \
@@ -129,11 +136,11 @@ class LaunchGuardTests(unittest.TestCase):
                  mock.patch.object(tool, 'launch_notice') as notify, \
                  mock.patch.object(tool.os, 'execve') as launch, \
                  mock.patch.object(tool.subprocess, 'run', side_effect=AssertionError('no second prepare')), \
-                 self.assertRaisesRegex(RuntimeError, 'Timed out'):
+                 self.assertRaisesRegex(RuntimeError, 'still being prepared'):
                 tool.open_app(self.root, 'brave', [])
             self.assertLess(time.monotonic() - start, 0.5)
             launch.assert_not_called()
-            self.assertIn('Timed out', notify.call_args.args[0])
+            self.assertIn('still being prepared', notify.call_args.args[0])
 
     def test_direct_core_prepare_uses_same_lock_and_records_failure(self):
         path = tool.session_lock_path(self.root)
@@ -230,17 +237,16 @@ class LaunchGuardTests(unittest.TestCase):
                 def prepare(argv, **kwargs):
                     with count.open('a') as output:
                         output.write('prepare\n')
-                    started.write_text('locked')
-                    deadline = time.monotonic() + 5
-                    while not finish.exists():
-                        if time.monotonic() >= deadline:
-                            return mock.Mock(returncode=1)
-                        time.sleep(0.005)
-                    for name in ('brave', 'code'):
-                        self.executable_fixture(name)
-                    for name in ('vscode-extensions', 'runtime/brave/config', 'runtime/brave/cache',
-                                 'cache/brave-profile', 'cache/vscode'):
-                        (self.root / name).mkdir(parents=True, exist_ok=True)
+                    with tool.app_prepare_guard(self.root, app):
+                        started.write_text('locked')
+                        deadline = time.monotonic() + 5
+                        while not finish.exists():
+                            if time.monotonic() >= deadline:
+                                return mock.Mock(returncode=1)
+                            time.sleep(0.005)
+                        for name in ('brave', 'code'):
+                            self.ready(name)
+                            self.executable_fixture(name)
                     return mock.Mock(returncode=0)
                 sys.stdout.flush()
                 pid = os.fork()
@@ -261,7 +267,7 @@ class LaunchGuardTests(unittest.TestCase):
                     # Receiving the wait notice proves the wrapper reached the
                     # held lock; it has not launched or configured app caches.
                     notice = process.stderr.readline()
-                    self.assertIn('still being prepared', notice)
+                    self.assertIn('is being prepared', notice)
                     self.assertFalse(launched.exists())
                     self.assertIsNone(process.poll())
                     self.assertFalse((self.root / 'runtime/brave/config').exists())

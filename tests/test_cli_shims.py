@@ -111,8 +111,7 @@ class CliShimTests(unittest.TestCase):
         expected = [p.read_bytes() for p in sentinels]
         self.icon_fixture()
         with mock.patch.object(tool, 'goinfre', return_value=self.root), \
-             mock.patch.object(tool, 'install'), mock.patch.object(tool, 'migrate'), \
-             mock.patch.object(tool, 'integrate', side_effect=lambda root: tool.desktop_integration(root)), \
+             mock.patch.object(tool, 'prepare_core', side_effect=lambda root: tool.desktop_integration(root)), \
              mock.patch.object(tool, 'run'):
             tool.main(['prepare'])
         self.assertEqual(expected, [p.read_bytes() for p in sentinels])

@@ -34,7 +34,13 @@ class SessionTests(unittest.TestCase):
         directory = self.home / '.local/bin'
         directory.mkdir(parents=True, exist_ok=True)
         for name in ('code-native', 'brave-native'):
-            (directory / name).write_text('# managed fixture')
+            wrapper = directory / name
+            wrapper.write_text(tool.native_wrapper_contents('brave' if name == 'brave-native' else 'code'))
+            wrapper.chmod(0o755)
+        tool.brave_caches(self.root)
+        tool.vscode_caches(self.root)
+        tool.environment(self.root, 'brave')
+        tool.environment(self.root, 'vscode')
 
     def session(self, command=None):
         with mock.patch.object(tool, 'goinfre', return_value=self.root), \
@@ -228,13 +234,16 @@ class SessionTests(unittest.TestCase):
             path.write_bytes(b'alias vssh=sentinel\xff\n')
         expected = [p.read_bytes() for p in paths]
         with mock.patch.object(tool, 'goinfre', return_value=self.root), \
-             mock.patch.object(tool, 'install') as install, \
+             mock.patch.object(tool, 'install', side_effect=fixtures.staged_install) as install, \
+             mock.patch.object(tool, 'activate_release'), mock.patch.object(tool, 'app_ready', return_value=True), \
              mock.patch.object(tool, 'migrate') as migrate, \
              mock.patch.object(tool, 'integrate') as integrate, \
              mock.patch.object(tool, 'install_codex', side_effect=AssertionError('optional forbidden')):
             tool.main(['prepare'])
-        for stage in (install, migrate, integrate):
-            stage.assert_called_once_with(self.root)
+        self.assertEqual(install.call_args_list, [mock.call(self.root, 'brave', activate=False),
+                                                  mock.call(self.root, 'code', activate=False)])
+        for stage in (migrate, integrate):
+            self.assertEqual(stage.call_args_list, [mock.call(self.root, 'brave'), mock.call(self.root, 'code')])
         self.assertEqual(expected, [p.read_bytes() for p in paths])
         for forbidden in ('def install_spotify', 'def install_claude', 'def install_pyenv'):
             self.assertNotIn(forbidden, fixtures.SCRIPT.read_text())

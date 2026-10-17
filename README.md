@@ -132,11 +132,13 @@ The tool reports running apps and refuses risky steps; it never force-kills them
 ./thin-client-setup prepare
 ```
 
-Preparation installs the small setup script under `~/.local/bin`, downloads
-official releases, verifies SHA-256, stages/version-controls app releases, copies
-selected persistent data, installs Remote SSH and its small dependencies, then
-writes managed launchers and the VS Code URI handler. It does **not launch apps**
-or retire old profiles. Existing unmanaged destinations are refused.
+Preparation installs the small setup script under `~/.local/bin`, then completes
+Brave installation, migration and integration before downloading Code. Each app
+uses official SHA-256-verified releases and versioned staging, persistent profile
+handling and managed launchers/icons. Code also installs Remote SSH essentials
+and its URI handler. A failed app is reported after the other app has been tried.
+Preparation does **not launch apps** or retire old profiles. Existing unmanaged
+destinations are refused.
 
 Separate commands are available for troubleshooting:
 
@@ -204,21 +206,35 @@ Or use **Brave (native thin client)** and **VS Code (native thin client)** in th
 app menu. Launchers never download code. If goinfre was cleared, explicitly rerun
 `~/.local/bin/thin-client-setup prepare` to restore reproducible app files.
 
-If graphical-login preparation is still active, native Brave/Code launchers wait
-on the same `runtime/session-init.lock` before inspecting or changing app caches.
-Terminal commands (`brave`, `code .`) and desktop/favorite launchers all use this
-guard. A ready post acquires the lock immediately, without notifications, network
-access or a delay. Direct core install/migrate/integrate/prepare commands also
-hold this existing lock; automatic preparation passes its lock to its child.
+Native launchers check **only their own application's readiness**. Brave can open
+as soon as its own installation/integration is complete, even while Code is still
+downloading or preparing; Code can likewise use an existing ready installation
+while Brave prepares. The global session lock only prevents duplicate bootstrap
+jobs. Neither app waits for the other app's lock or its failure result.
 
-While waiting, the launcher prints a short stderr message and sends an optional
-desktop notification if `notify-send` is available. It waits at most **ten
-minutes**, then returns nonzero with a `session status` instruction. After setup
-releases the lock, the launcher checks its successful result and the requested
-app's binary, profile and runtime/extension directories. Failed/incomplete setup
-does not launch the app. The shared lock remains held through exec to prevent
-preparation from starting between validation and application startup. Launchers
-never start a second prepare, kill applications or edit shell files.
+Machine-local `runtime/brave-prepare.lock` and `runtime/code-prepare.lock` protect
+activation and profile/cache/runtime/launcher integration for the respective app.
+Downloads and checksum-verified extraction into versioned staging locations run
+without these exclusive locks, leaving a usable current app available. Activation
+still requires that app to be stopped; a running app keeps its old release and
+the staged update is retained. Nothing is force-killed or automatically pruned.
+
+If the requested app is in a critical phase, its launcher prints a short stderr
+message, optionally calls `notify-send`, and waits **at most 60 seconds** on that
+app's lock. Timeout or incomplete integration returns nonzero and points to
+`thin-client-setup session status`. Missing/not-yet-downloaded apps are refused
+without starting a second prepare or waiting through a long download. CLI shims,
+desktop entries, favorites and Code URL callbacks all use the same guard; their
+arguments pass through unchanged. Shared app locks remain held through exec to
+protect the validation/launch handoff, and never block work on the other app.
+
+Readiness requires real app binaries, the managed executable wrapper, persistent
+profile marker, correct reviewed cache links/targets, runtime paths and (for Code)
+the extension directory. Bounded per-app progress records in goinfre track the
+phase and completed release. A record alone cannot make missing artifacts ready;
+an interrupted critical integration remains incomplete until that app is repaired.
+Older installations without per-app records retain the reviewed local cache/runtime
+reconstruction path. A ready launch makes no network request and shows no notice.
 
 `install-self` never adds shell startup commands or enables autostart. Use full
 launcher paths, or add the personal bin directory to PATH yourself after review;
@@ -550,9 +566,11 @@ markers or stale success records alone cannot establish readiness on a new post.
 On a ready post it exits silently, performs no version/update checks, network
 requests, package installation, doctor checks or recursive HOME scans.
 
-On an unprepared post it invokes the existing **core-only** `prepare` once under
-a nonblocking goinfre lock. Concurrent invocations return immediately. The
-preparation child inherits the lock so it stays held if the initializer dies;
+On an unprepared post it invokes **core-only** `prepare` once under a nonblocking
+global goinfre lock. Preparation finishes each app separately, publishing Brave
+readiness before starting Code downloads. A failure in either app does not stop
+the other app from being prepared or launched. Concurrent invocations return
+immediately. The preparation child inherits the lock so it stays held if the initializer dies;
 the OS releases locks when their last holder exits. Lock files may remain without
 locking anything. No marker can permanently prevent recovery.
 
@@ -574,13 +592,16 @@ Use `thin-client-setup session status` for a compact read-only summary:
 ```text
 1337 session
   Autostart enabled
-  Core     ready
+  Core     preparing
   Brave    ready
-  Code     ready
+  Code     preparing
   Codex    installed
   HOME fs  3.5G free / 4.6G
-  Last init successful
+  Last init running
 ```
+
+Once both apps finish, Core becomes ready. Per-app status uses current artifacts
+and active locks; a stale progress record alone does not claim a job is running.
 
 HOME fs is filesystem free space/capacity, **not an account quota or HOME size**;
 it uses filesystem metadata, not `du`. Codex readiness is informational only.

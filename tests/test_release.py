@@ -159,7 +159,7 @@ class ReleaseTests(unittest.TestCase):
         (path / 'some-test-file').write_bytes(b'production reproduction fixture')
         with self.fake_mount(), mock.patch.object(tool, 'goinfre', return_value=self.root), \
              mock.patch.object(tool, 'stopped') as stopped, mock.patch.object(tool, 'install_self'), \
-             mock.patch.object(tool, 'install'), mock.patch.object(tool, 'run'), \
+             mock.patch.object(tool, 'install', side_effect=fixtures.staged_install), mock.patch.object(tool, 'activate_release'), mock.patch.object(tool, 'run'), \
              mock.patch.object(tool, 'desktop_integration'), \
              contextlib.redirect_stdout(io.StringIO()) as output:
             tool.main(['prepare'])
@@ -235,7 +235,7 @@ class ReleaseTests(unittest.TestCase):
                 self.fail(f'Cache setup inspected persistent site state: {path}')
             return original_stat(path, *args, **kwargs)
         with self.fake_mount(), mock.patch.object(tool, 'goinfre', return_value=self.root), \
-             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'install'), \
+             mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'install', side_effect=fixtures.staged_install), mock.patch.object(tool, 'activate_release'), \
              mock.patch.object(tool, 'stopped'), mock.patch.object(tool, 'run'), \
              mock.patch.object(tool, 'desktop_integration'), mock.patch.object(tool.os, 'execve') as execute:
             original_stat = Path.stat  # retain the fixture's separate-filesystem simulation
@@ -379,12 +379,12 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'prepare explicitly'):
                 tool.open_app(self.root, 'brave', [])
             install.assert_not_called()
-        def restore_binaries(root):
-            self.native_fixture('brave')
-            self.native_fixture('code')
+        def restore_binaries(root, app, *, activate=False):
+            self.native_fixture(app)
+            return fixtures.staged_install(root, app, activate=activate)
         with mock.patch.object(tool, 'goinfre', return_value=self.root), \
              mock.patch.object(tool, 'install_self'), mock.patch.object(tool, 'stopped'), \
-             mock.patch.object(tool, 'install', side_effect=restore_binaries), \
+             mock.patch.object(tool, 'install', side_effect=restore_binaries), mock.patch.object(tool, 'activate_release'), \
              mock.patch.object(tool, 'run'), mock.patch.object(tool, 'desktop_integration'):
             tool.main(['prepare'])
         self.assertTrue((tool.BRAVE / 'GPUCache').is_dir())

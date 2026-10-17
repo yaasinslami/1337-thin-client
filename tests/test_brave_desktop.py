@@ -153,7 +153,7 @@ class BraveDesktopTests(unittest.TestCase):
                 return mock.Mock(stdout='')
             return execute(args, **kwargs)
         with self.fake_mount(), mock.patch.object(tool, 'goinfre', return_value=self.root), \
-             mock.patch.object(tool, 'install'), mock.patch.object(tool, 'install_self'), \
+             mock.patch.object(tool, 'install', side_effect=fixtures.staged_install), mock.patch.object(tool, 'activate_release'), mock.patch.object(tool, 'install_self'), \
              mock.patch.object(tool, 'stopped'), mock.patch.object(tool, 'run', side_effect=run):
             tool.main(['desktop'])
             apps = self.home / '.local/share/applications'

@@ -36,7 +36,7 @@ OLD_BRAVE = HOME / '.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browse
 OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
 STATE = HOME / '.local/share/thin-client'
 SELF = HOME / '.local/bin/thin-client-setup'
-VERSION = '0.4.1'
+VERSION = '0.4.2'
 BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS = (
     Path('Cache'), Path('Code Cache'), Path('GPUCache'),
     Path('DawnGraphiteCache'), Path('DawnWebGPUCache'),
@@ -268,7 +268,7 @@ def switch(link, target):
     tmp.symlink_to(target)
     os.replace(tmp, link)
 
-def install_app(root, app, version, url, sha, kind, work):
+def install_app(root, app, version, url, sha, kind, work, *, activate=True):
     if not re.fullmatch(r'[0-9A-Za-z._-]+', version) or not re.fullmatch(r'[0-9a-fA-F]{64}', sha):
         raise RuntimeError(f'Invalid version/checksum for {app}')
     appdir = safe(root / 'apps' / app)
@@ -298,35 +298,71 @@ def install_app(root, app, version, url, sha, kind, work):
             'version': version, 'sha256': sha.lower(), 'url': url}, indent=2) + '\n')
         payload.rename(dest)
         print(f'Installed new release: {dest}', flush=True)
-    switch(appdir / 'current', dest)
-    # Prior releases/downloads are intentionally retained, never auto-cleaned.
-    print(f'Activated: {appdir / "current"} -> {dest}', flush=True)
+    if activate:
+        name = 'brave' if app == 'brave' else 'code'
+        with app_prepare_guard(root, name):
+            activate_release(root, name, dest)
+    return dest
 
-def install(root):
+
+def activate_release(root, app, release):
+    stopped(('brave' if app == 'brave' else 'vscode',))
+    directory = safe(root / 'apps' / ('brave' if app == 'brave' else 'vscode'))
+    app_progress(root, app, critical_incomplete=True)
+    switch(directory / 'current', release)
+    # Prior releases/downloads are intentionally retained, never auto-cleaned.
+    print(f'Activated: {directory / "current"} -> {release}', flush=True)
+
+
+def install(root, app=None, *, activate=True):
     if os.uname().machine != 'x86_64':
         raise RuntimeError('This release currently supports Linux x86_64 only')
-    # First installation cannot affect running Flatpak applications. Updates
-    # refuse activation until applications are stopped; old releases are retained.
-    if any((root / 'apps' / app / 'current').exists() for app in ['brave', 'vscode']):
-        stopped()
+    if app is None:
+        for name in ('brave', 'code'):
+            install(root, name, activate=activate)
+        return
     safe(root / 'tmp').mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix='download-', dir=root / 'tmp'))
+    work = Path(tempfile.mkdtemp(prefix=f'download-{app}-', dir=root / 'tmp'))
     print(f'Download staging (retained on success/failure): {work}', flush=True)
-    version = text_url('https://versions.brave.com/latest/release-linux-x64.version', work, 'brave-version')
-    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
-        raise RuntimeError('Invalid Brave stable version')
-    # Protect existing profile from an accidental Brave version downgrade.
-    for profile in (OLD_BRAVE, BRAVE):
-        last = profile / 'Last Version'
-        if last.exists():
-            parts = last.read_text().strip().split('.')[-3:]
-            if tuple(map(int, version.split('.'))) < tuple(map(int, parts)):
-                raise RuntimeError('Latest downloaded Brave would downgrade an existing profile')
-    url = f'https://github.com/brave/brave-browser/releases/download/v{version}/brave-browser-{version}-linux-amd64.zip'
-    sha = text_url(url + '.sha256', work, 'brave-sha256').split()[0]
+    if app == 'brave':
+        version = text_url('https://versions.brave.com/latest/release-linux-x64.version', work, 'brave-version')
+        if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+            raise RuntimeError('Invalid Brave stable version')
+        # Protect persistent profiles from accidental browser downgrades.
+        for profile in (OLD_BRAVE, BRAVE):
+            last = profile / 'Last Version'
+            if last.exists():
+                parts = last.read_text().strip().split('.')[-3:]
+                if tuple(map(int, version.split('.'))) < tuple(map(int, parts)):
+                    raise RuntimeError('Latest downloaded Brave would downgrade an existing profile')
+        url = f'https://github.com/brave/brave-browser/releases/download/v{version}/brave-browser-{version}-linux-amd64.zip'
+        sha = text_url(url + '.sha256', work, 'brave-sha256').split()[0]
+        return install_app(root, 'brave', version, url, sha, 'zip', work, activate=activate)
     meta = json.loads(text_url('https://update.code.visualstudio.com/api/update/linux-x64/stable/latest', work, 'vscode-meta.json'))
-    install_app(root, 'brave', version, url, sha, 'zip', work)
-    install_app(root, 'vscode', meta['productVersion'], meta['url'], meta['sha256hash'], 'tar', work)
+    return install_app(root, 'vscode', meta['productVersion'], meta['url'], meta['sha256hash'],
+                       'tar', work, activate=activate)
+
+
+def prepare_core(root):
+    """Complete each app before downloading the next; keep failures independent."""
+    failed = []
+    for app in ('brave', 'code'):
+        try:
+            app_progress(root, app, phase='downloading', result='running')
+            release = install(root, app, activate=False)
+            with app_prepare_guard(root, app):
+                activate_release(root, app, release)
+                migrate(root, app)
+                integrate(root, app)
+            if not app_ready(root, app):
+                raise RuntimeError(f'{app} integration is incomplete')
+        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
+            app_progress(root, app, result='failed', error=type(error).__name__)
+            failed.append(app)
+            print(f'{app} preparation failed: {error}', file=sys.stderr, flush=True)
+    if failed:
+        raise RuntimeError('Core preparation failed for: ' + ', '.join(failed) +
+                           '; healthy applications remain available')
 
 def cache_link(path, target):
     safe(path.parent)
@@ -415,25 +451,34 @@ def brave_caches(root):
         for relative in brave_disposable_relative_paths(BRAVE):
             brave_cache_link(BRAVE / relative, root / 'cache/brave-profile' / relative, root)
 
-def migrate(root):
-    stopped()
-    safe(BRAVE); safe(CODE)
-    if not (BRAVE / '.thin-client-import').exists():
-        if BRAVE.exists():
-            raise RuntimeError(f'Existing native Brave data left intact; manual review required: {BRAVE}')
-        stage = BRAVE.with_name('Brave-Browser.thin-client-partial')
-        if stage.exists():
-            raise RuntimeError(f'Incomplete migration exists; inspect before retry: {stage}')
-        if not OLD_BRAVE.exists():
-            BRAVE.mkdir(parents=True, mode=0o700)
-            (BRAVE / '.thin-client-import').write_text('New native profile; no Flatpak source found\n')
-            print('Prepared an empty native Brave profile; no source was copied', flush=True)
-        else:
-            migrate_brave(stage)
-    if not (CODE / '.thin-client-import').exists():
-        migrate_code()
-    vscode_caches(root)
-    brave_caches(root)
+def migrate(root, app=None):
+    if app is None:
+        for name in ('brave', 'code'):
+            with app_prepare_guard(root, name):
+                migrate(root, name)
+        return
+    stopped(('brave' if app == 'brave' else 'vscode',))
+    app_progress(root, app, critical_incomplete=True)
+    if app == 'brave':
+        safe(BRAVE)
+        if not (BRAVE / '.thin-client-import').exists():
+            if BRAVE.exists():
+                raise RuntimeError(f'Existing native Brave data left intact; manual review required: {BRAVE}')
+            stage = BRAVE.with_name('Brave-Browser.thin-client-partial')
+            if stage.exists():
+                raise RuntimeError(f'Incomplete migration exists; inspect before retry: {stage}')
+            if not OLD_BRAVE.exists():
+                BRAVE.mkdir(parents=True, mode=0o700)
+                (BRAVE / '.thin-client-import').write_text('New native profile; no Flatpak source found\n')
+                print('Prepared an empty native Brave profile; no source was copied', flush=True)
+            else:
+                migrate_brave(stage)
+        brave_caches(root)
+    else:
+        safe(CODE)
+        if not (CODE / '.thin-client-import').exists():
+            migrate_code()
+        vscode_caches(root)
 
 def migrate_brave(stage):
     safe(OLD_BRAVE)
@@ -528,19 +573,28 @@ def code_args(root):
     return [root / 'apps/vscode/current/bin/code', '--user-data-dir', CODE,
             '--extensions-dir', root / 'vscode-extensions']
 
-def integrate(root):
-    if not (CODE / '.thin-client-import').exists() or not (BRAVE / '.thin-client-import').exists():
+def integrate(root, app=None):
+    if app is None:
+        for name in ('brave', 'code'):
+            with app_prepare_guard(root, name):
+                integrate(root, name)
+        return
+    profile = BRAVE if app == 'brave' else CODE
+    if not (profile / '.thin-client-import').exists():
         raise RuntimeError('Complete migration before integration')
-    stopped()
-    vscode_caches(root)
-    brave_caches(root)
-    environment(root, 'brave')  # Reconstruct workstation-local runtime on prepare.
-    env = environment(root, 'vscode')
-    for ext in EXTENSIONS:
-        run([*code_args(root), '--install-extension', ext], env=env)
-    print('Local extension inventory:', flush=True)
-    run([*code_args(root), '--list-extensions', '--show-versions'], env=env)
-    desktop_integration(root)
+    stopped(('brave' if app == 'brave' else 'vscode',))
+    app_progress(root, app, critical_incomplete=True)
+    if app == 'brave':
+        brave_caches(root)
+        environment(root, 'brave')
+    else:
+        vscode_caches(root)
+        env = environment(root, 'vscode')
+        for ext in EXTENSIONS:
+            run([*code_args(root), '--install-extension', ext], env=env)
+        print('Local extension inventory:', flush=True)
+        run([*code_args(root), '--list-extensions', '--show-versions'], env=env)
+    desktop_integration(root, app)
 
 def install_bundled_icon(root, app, relative, title, command):
     """Copy the bundled PNG; current may link only into managed releases."""
@@ -654,19 +708,29 @@ def hide_system_applications(apps):
             continue  # Preserve an existing user hiding override byte-for-byte.
         managed_file(path, '[Desktop Entry]\n# Managed by thin-client-setup\nHidden=true\n', 0o644)
 
-def desktop_integration(root):
+def native_wrapper_contents(app):
+    return ('#!/bin/sh\n# Managed by thin-client-setup\nexec ' + shlex.quote(str(SELF)) +
+            ' open ' + app + ' "$@"\n')
+
+
+def desktop_integration(root, selected=None):
     """Write launchers without installing extensions or requiring apps to quit."""
-    icon_path = install_code_icon(root)
-    brave_icon = install_brave_icon(root)
-    theme = icon_path.parents[2]
+    icons = {}
+    if selected in (None, 'brave'):
+        icons['brave'] = install_brave_icon(root)
+    if selected in (None, 'code'):
+        icons['code'] = install_code_icon(root)
+    theme = next(iter(icons.values())).parents[2]
     apps = HOME / '.local/share/applications'
     safe(apps).mkdir(parents=True, exist_ok=True)
     safe(HOME / '.local/bin').mkdir(parents=True, exist_ok=True)
     for app, title, command, icon, category in [
-        ('brave', 'Brave (native thin client)', 'brave-native', str(brave_icon), 'Network;WebBrowser;'),
-        ('code', 'VS Code (native thin client)', 'code-native', str(icon_path), 'Development;IDE;')]:
+        ('brave', 'Brave (native thin client)', 'brave-native', str(icons.get('brave', '')), 'Network;WebBrowser;'),
+        ('code', 'VS Code (native thin client)', 'code-native', str(icons.get('code', '')), 'Development;IDE;')]:
+        if selected is not None and selected != app:
+            continue
         wrapper = HOME / '.local/bin' / command
-        contents = '#!/bin/sh\n# Managed by thin-client-setup\nexec ' + shlex.quote(str(SELF)) + ' open ' + app + ' "$@"\n'
+        contents = native_wrapper_contents(app)
         managed_file(wrapper, contents, 0o755)
         entry = apps / (command + '.desktop')
         contents = ('[Desktop Entry]\n# Managed by thin-client-setup\nType=Application\n'
@@ -675,13 +739,14 @@ def desktop_integration(root):
         if app == 'brave':
             contents += 'MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;\n'
         managed_file(entry, contents, 0o644)
-    wrapper = HOME / '.local/bin/code-native'
-    managed_file(apps / 'code-native-url-handler.desktop',
-                 '[Desktop Entry]\n# Managed by thin-client-setup\n'
-                 'Type=Application\nName=VS Code (native thin client) - URL Handler\n'
-                 f'Exec="{wrapper}" --open-url %U\n'
-                 f'Icon={icon_path}\nNoDisplay=true\nStartupNotify=true\n'
-                 'Categories=Development;IDE;\nMimeType=x-scheme-handler/vscode;\n', 0o644)
+    if 'code' in icons:
+        wrapper = HOME / '.local/bin/code-native'
+        managed_file(apps / 'code-native-url-handler.desktop',
+                     '[Desktop Entry]\n# Managed by thin-client-setup\n'
+                     'Type=Application\nName=VS Code (native thin client) - URL Handler\n'
+                     f'Exec="{wrapper}" --open-url %U\n'
+                     f'Icon={icons["code"]}\nNoDisplay=true\nStartupNotify=true\n'
+                     'Categories=Development;IDE;\nMimeType=x-scheme-handler/vscode;\n', 0o644)
     hide_system_applications(apps)
     install_cli_shims()
     for command in [
@@ -693,8 +758,9 @@ def desktop_integration(root):
             except (OSError, subprocess.CalledProcessError) as error:
                 print(f'Optional desktop cache refresh failed: {command[0]} ({type(error).__name__}); '
                       'logout/login can refresh GNOME menu state.', flush=True)
-    run(['xdg-mime', 'default', 'code-native-url-handler.desktop', 'x-scheme-handler/vscode'],
-        env=xdg_environment())
+    if 'code' in icons:
+        run(['xdg-mime', 'default', 'code-native-url-handler.desktop', 'x-scheme-handler/vscode'],
+            env=xdg_environment())
     print('Launchers installed; vscode URI handler registered; browser default and shell configuration unchanged', flush=True)
 
 def managed_file(path, contents, mode):
@@ -711,7 +777,7 @@ def managed_file(path, contents, mode):
     elif stat.S_IMODE(path.stat().st_mode) != mode:
         path.chmod(mode)
 
-LAUNCH_WAIT_SECONDS = 600
+LAUNCH_WAIT_SECONDS = 60
 LAUNCH_POLL_SECONDS = 0.1
 PREPARE_LOCK_FD = 'THIN_CLIENT_PREPARE_LOCK_FD'
 
@@ -737,22 +803,49 @@ def session_lock_path(root):
     return path
 
 
-def app_ready(root, app):
-    """After a wait, inspect only this application's required artifacts."""
+def app_artifacts_ready(root, app):
+    """Real per-app launch artifacts; no dependency on the other application."""
     profile = BRAVE if app == 'brave' else CODE
-    executable = 'apps/brave/current/brave' if app == 'brave' else 'apps/vscode/current/bin/code'
-    directories = ('runtime/brave/config', 'runtime/brave/cache', 'cache/brave-profile') if app == 'brave' else (
-        'vscode-extensions', 'cache/vscode')
-    return (os.access(root / executable, os.X_OK) and
-            (profile / '.thin-client-import').is_file() and
-            all((root / path).is_dir() for path in directories))
+    executable = root / ('apps/brave/current/brave' if app == 'brave' else 'apps/vscode/current/bin/code')
+    wrapper = HOME / '.local/bin' / (app + '-native')
+    directories = ('runtime/brave/config', 'runtime/brave/cache', 'cache/brave-profile', 'tmp') if app == 'brave' else (
+        'vscode-extensions', 'cache/vscode', 'tmp')
+    try:
+        safe(profile)
+        safe(wrapper)
+        if (not os.access(executable, os.X_OK) or not executable.resolve().is_relative_to(root) or
+                not (profile / '.thin-client-import').is_file() or not os.access(wrapper, os.X_OK) or
+                wrapper.read_text() != native_wrapper_contents(app)):
+            return False
+        if not all(safe(root / path).is_dir() for path in directories):
+            return False
+        relatives = brave_disposable_relative_paths(profile) if app == 'brave' else map(Path, CODE_CACHES)
+        for relative in relatives:
+            link = profile / relative
+            target = root / ('cache/brave-profile' if app == 'brave' else 'cache/vscode') / relative
+            if not link.is_symlink() or link.resolve() != target or not safe(target).is_dir():
+                return False
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def app_ready(root, app):
+    if not app_artifacts_ready(root, app):
+        return False
+    record = read_app_progress(root, app)
+    if record.get('critical_incomplete'):
+        return False
+    release = record.get('integrated_release')
+    current = root / 'apps' / ('brave' if app == 'brave' else 'vscode') / 'current'
+    return release is None or release == str(current.resolve())
 
 
 @contextlib.contextmanager
 def launch_guard(root, app):
-    """Use the initializer's lock through exec, closing the launch/prepare race."""
+    """Only this app's critical phase can delay its launcher."""
     title = 'Brave' if app == 'brave' else 'VS Code'
-    with session_lock_path(root).open('a') as lock:
+    with app_lock_path(root, app).open('a+') as lock:
         deadline, waited = time.monotonic() + LAUNCH_WAIT_SECONDS, False
         while True:
             try:
@@ -761,30 +854,23 @@ def launch_guard(root, app):
             except BlockingIOError:
                 if not waited:
                     waited = True
-                    launch_notice('This workstation is still being prepared. '
-                                  f'{title} will open when setup finishes.')
+                    launch_notice(f'{title} is being prepared. It will open when its setup finishes.')
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    message = 'Timed out waiting for workstation preparation. Run: thin-client-setup session status'
+                    message = f'{title} is still being prepared. Check: thin-client-setup session status'
                     launch_notice(message)
                     raise RuntimeError(message)
                 time.sleep(min(LAUNCH_POLL_SECONDS, remaining))
+        record = read_app_progress(root, app)
         ready = app_ready(root, app)
-        if waited or not ready:
-            try:
-                result = read_session_log(root).get('result')
-                successful = (result == 'success' and ready) if waited else result not in ('failed', 'running')
-            except (OSError, RuntimeError, ValueError):
-                successful = not waited
-            if not successful:
-                message = 'Workstation preparation failed. Run: thin-client-setup session status'
-                launch_notice(message)
-                raise RuntimeError(message)
-        # Keep the shared lock through exec: preparation cannot slip in between
-        # validation and the kernel starting the application. No new lock system.
+        # Older prepared installs have no per-app state yet. Their existing
+        # reviewed launch path can reconstruct local cache/runtime links safely.
+        if not ready and (waited or record):
+            message = f'{title} is not ready. Check: thin-client-setup session status'
+            launch_notice(message)
+            raise RuntimeError(message)
         os.set_inheritable(lock.fileno(), True)
         yield
-
 
 def open_app(root, app, args):
     if any(a.startswith(('--user-data-dir', '--extensions-dir', '--disk-cache-dir', '--disk-cache-size')) for a in args):
@@ -1175,16 +1261,13 @@ def remove_legacy_zsh_trigger():
 
 
 def core_ready(root):
-    return (all(os.access(root / p, os.X_OK) for p in
-                ('apps/brave/current/brave', 'apps/vscode/current/bin/code')) and
-            all(p.is_file() for p in (BRAVE / '.thin-client-import', CODE / '.thin-client-import',
-                                     HOME / '.local/bin/brave-native', HOME / '.local/bin/code-native')) and
-            all((root / p).is_dir() for p in
-                ('vscode-extensions', 'runtime/brave/config', 'runtime/brave/cache')))
+    return all(app_ready(root, app) for app in ('brave', 'code'))
 
 
-def read_session_log(root):
-    path = safe(root / 'runtime/session-init.log')
+def read_runtime_record(root, name):
+    if name not in ('session-init.log', 'brave-prepare.json', 'code-prepare.json'):
+        raise RuntimeError('Unknown runtime record')
+    path = safe(root / 'runtime' / name)
     if not path.exists():
         return {}
     if not path.is_file():
@@ -1200,9 +1283,11 @@ def read_session_log(root):
         return {}
 
 
-def write_session_log(runtime, record):
+def write_runtime_record(runtime, record, name):
     """Only fixed metadata, atomically replaced each run; never child output."""
-    path = safe(runtime / 'session-init.log')
+    if name not in ('session-init.log', 'brave-prepare.json', 'code-prepare.json'):
+        raise RuntimeError('Unknown runtime record')
+    path = safe(runtime / name)
     data = (json.dumps(record, indent=2) + '\n').encode()
     if len(data) > SESSION_LOG_LIMIT:
         raise RuntimeError('Session log exceeds its fixed bound')
@@ -1213,6 +1298,96 @@ def write_session_log(runtime, record):
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def read_session_log(root):
+    return read_runtime_record(root, 'session-init.log')
+
+
+def write_session_log(runtime, record):
+    write_runtime_record(runtime, record, 'session-init.log')
+
+
+def read_app_progress(root, app):
+    record = read_runtime_record(root, app + '-prepare.json')
+    if not record and (root / 'runtime' / (app + '-prepare.json')).exists():
+        return {'result': 'failed', 'critical_incomplete': True}
+    return record
+
+
+def app_progress(root, app, **fields):
+    runtime = safe(root / 'runtime')
+    runtime.mkdir(parents=True, exist_ok=True)
+    record = read_app_progress(root, app)
+    record.update(fields, timestamp=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+    write_runtime_record(runtime, record, app + '-prepare.json')
+
+
+def app_lock_path(root, app):
+    if app not in ('brave', 'code'):
+        raise RuntimeError('Unknown core application')
+    runtime = safe(root / 'runtime')
+    runtime.mkdir(parents=True, exist_ok=True)
+    path = safe(runtime / (app + '-prepare.lock'))
+    if path.exists() and not path.is_file():
+        raise RuntimeError('Expected a regular app preparation lock')
+    return path
+
+
+@contextlib.contextmanager
+def app_prepare_guard(root, app):
+    with app_lock_path(root, app).open('a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(f'Quit {app} before activation/integration; current release left intact') from error
+        app_progress(root, app, phase='critical', result='running')
+        try:
+            yield
+        except BaseException as error:
+            app_progress(root, app, phase='critical', result='failed', error=type(error).__name__)
+            raise
+        else:
+            ready = app_artifacts_ready(root, app)
+            current = root / 'apps' / ('brave' if app == 'brave' else 'vscode') / 'current'
+            app_progress(root, app, phase='ready' if ready else 'incomplete', result='success',
+                         critical_incomplete=not ready,
+                         integrated_release=str(current.resolve()) if ready else None)
+
+
+def exclusive_lock_active(path):
+    safe(path)
+    if not path.exists():
+        return False
+    if not path.is_file():
+        raise RuntimeError('Expected a regular preparation lock')
+    with path.open('r') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+
+
+def critical_app_active(root, app):
+    return exclusive_lock_active(root / 'runtime' / (app + '-prepare.lock'))
+
+
+def core_job_active(root):
+    return exclusive_lock_active(root / 'runtime/session-init.lock')
+
+
+def app_status(root, app):
+    if root is None:
+        return 'not prepared'
+    if critical_app_active(root, app):
+        return 'preparing'
+    if app_ready(root, app):
+        return 'ready'
+    state = read_app_progress(root, app)
+    if state.get('result') == 'running' and core_job_active(root):
+        return 'preparing'
+    return 'failed' if state.get('result') == 'failed' else 'not prepared'
 
 
 @contextlib.contextmanager
@@ -1236,8 +1411,7 @@ def core_prepare_guard(root):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise RuntimeError('Core preparation or an application launch is active; '
-                               'quit native apps and check thin-client-setup session status') from error
+            raise RuntimeError('Core preparation is already active; check thin-client-setup session status') from error
         runtime = root / 'runtime'
         record = {'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                   'core': 'preparing', 'prepare_started': True,
@@ -1275,10 +1449,12 @@ def session_status():
         root = goinfre()
     except (OSError, RuntimeError):
         root = None
-    print(f'  Core     {"ready" if root is not None and core_ready(root) else "not prepared"}')
-    for label, relative in (('Brave', 'apps/brave/current/brave'), ('Code', 'apps/vscode/current/bin/code')):
-        ready = root is not None and os.access(root / relative, os.X_OK)
-        print(f'  {label:8} {"ready" if ready else "not prepared"}')
+    states = {app: app_status(root, app) for app in ('brave', 'code')}
+    active = root is not None and core_job_active(root)
+    core = 'preparing' if active or 'preparing' in states.values() else 'ready' if all(v == 'ready' for v in states.values()) else 'not prepared'
+    print(f'  Core     {core}')
+    for app, label in (('brave', 'Brave'), ('code', 'Code')):
+        print(f'  {label:8} {states[app]}')
     print(f'  Codex    {"installed" if codex_installed(root) else "not installed on this post"}')
     try:
         usage = shutil.disk_usage(HOME)
@@ -1530,11 +1706,13 @@ def main(argv=None):
         safe(root).mkdir(parents=True, exist_ok=True)
         if command in ['install', 'integrate', 'desktop', 'prepare', 'defaults']:
             install_self()
-        if command in ['install', 'prepare']:
+        if command == 'prepare':
+            prepare_core(root)
+        if command == 'install':
             install(root)
-        if command in ['migrate', 'prepare']:
+        if command == 'migrate':
             migrate(root)
-        if command in ['integrate', 'prepare']:
+        if command == 'integrate':
             integrate(root)
         if command in ['desktop', 'defaults']:
             desktop_integration(root)

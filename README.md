@@ -205,6 +205,22 @@ Or use **Brave (native thin client)** and **VS Code (native thin client)** in th
 app menu. Launchers never download code. If goinfre was cleared, explicitly rerun
 `~/.local/bin/thin-client-setup prepare` to restore reproducible app files.
 
+If graphical-login preparation is still active, native Brave/Code launchers wait
+on the same `runtime/session-init.lock` before inspecting or changing app caches.
+Terminal commands (`brave`, `code .`) and desktop/favorite launchers all use this
+guard. A ready post acquires the lock immediately, without notifications, network
+access or a delay. Direct core install/migrate/integrate/prepare commands also
+hold this existing lock; automatic preparation passes its lock to its child.
+
+While waiting, the launcher prints a short stderr message and sends an optional
+desktop notification if `notify-send` is available. It waits at most **ten
+minutes**, then returns nonzero with a `session status` instruction. After setup
+releases the lock, the launcher checks its successful result and the requested
+app's binary, profile and runtime/extension directories. Failed/incomplete setup
+does not launch the app. The shared lock remains held through exec to prevent
+preparation from starting between validation and application startup. Launchers
+never start a second prepare, kill applications or edit shell files.
+
 `install-self` never adds shell startup commands or enables autostart. Use full
 launcher paths, or add the personal bin directory to PATH yourself after review;
 PATH is never edited automatically.

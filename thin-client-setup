@@ -11,6 +11,7 @@ README.md and THIRD_PARTY_NOTICES.md for attribution and storage details.
 """
 import argparse
 import configparser
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -36,7 +37,7 @@ OLD_BRAVE = HOME / '.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browse
 OLD_CODE = HOME / '.var/app/com.visualstudio.code/config/Code/User'
 STATE = HOME / '.local/share/thin-client'
 SELF = HOME / '.local/bin/thin-client-setup'
-VERSION = '0.4.0'
+VERSION = '0.4.1'
 BRAVE_PROFILE_DISPOSABLE_CACHE_PATHS = (
     Path('Cache'), Path('Code Cache'), Path('GPUCache'),
     Path('DawnGraphiteCache'), Path('DawnWebGPUCache'),
@@ -711,9 +712,89 @@ def managed_file(path, contents, mode):
     elif stat.S_IMODE(path.stat().st_mode) != mode:
         path.chmod(mode)
 
+LAUNCH_WAIT_SECONDS = 600
+LAUNCH_POLL_SECONDS = 0.1
+PREPARE_LOCK_FD = 'THIN_CLIENT_PREPARE_LOCK_FD'
+
+
+def launch_notice(message):
+    print(f'1337 Thin Client: {message}', file=sys.stderr, flush=True)
+    notifier = shutil.which('notify-send')
+    if notifier:
+        try:
+            subprocess.run([notifier, '--expire-time=7000', '1337 Thin Client', message],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=1, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # Notifications are optional; stderr always remains available.
+
+
+def session_lock_path(root):
+    runtime = safe(root / 'runtime')
+    runtime.mkdir(parents=True, exist_ok=True)
+    path = safe(runtime / 'session-init.lock')
+    if path.exists() and not path.is_file():
+        raise RuntimeError('Expected a regular session lock')
+    return path
+
+
+def app_ready(root, app):
+    """After a wait, inspect only this application's required artifacts."""
+    profile = BRAVE if app == 'brave' else CODE
+    executable = 'apps/brave/current/brave' if app == 'brave' else 'apps/vscode/current/bin/code'
+    directories = ('runtime/brave/config', 'runtime/brave/cache', 'cache/brave-profile') if app == 'brave' else (
+        'vscode-extensions', 'cache/vscode')
+    return (os.access(root / executable, os.X_OK) and
+            (profile / '.thin-client-import').is_file() and
+            all((root / path).is_dir() for path in directories))
+
+
+@contextlib.contextmanager
+def launch_guard(root, app):
+    """Use the initializer's lock through exec, closing the launch/prepare race."""
+    title = 'Brave' if app == 'brave' else 'VS Code'
+    with session_lock_path(root).open('a') as lock:
+        deadline, waited = time.monotonic() + LAUNCH_WAIT_SECONDS, False
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not waited:
+                    waited = True
+                    launch_notice('This workstation is still being prepared. '
+                                  f'{title} will open when setup finishes.')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    message = 'Timed out waiting for workstation preparation. Run: thin-client-setup session status'
+                    launch_notice(message)
+                    raise RuntimeError(message)
+                time.sleep(min(LAUNCH_POLL_SECONDS, remaining))
+        ready = app_ready(root, app)
+        if waited or not ready:
+            try:
+                result = read_session_log(root).get('result')
+                successful = (result == 'success' and ready) if waited else result not in ('failed', 'running')
+            except (OSError, RuntimeError, ValueError):
+                successful = not waited
+            if not successful:
+                message = 'Workstation preparation failed. Run: thin-client-setup session status'
+                launch_notice(message)
+                raise RuntimeError(message)
+        # Keep the shared lock through exec: preparation cannot slip in between
+        # validation and the kernel starting the application. No new lock system.
+        os.set_inheritable(lock.fileno(), True)
+        yield
+
+
 def open_app(root, app, args):
     if any(a.startswith(('--user-data-dir', '--extensions-dir', '--disk-cache-dir', '--disk-cache-size')) for a in args):
         raise RuntimeError('Storage overrides belong in the reviewed setup, not launcher arguments')
+    with launch_guard(root, app):
+        launch_app(root, app, args)
+
+
+def launch_app(root, app, args):
     exe = root / ('apps/brave/current/brave' if app == 'brave' else 'apps/vscode/current/bin/code')
     if not os.access(exe, os.X_OK):
         raise RuntimeError('Goinfre app missing: run ~/.local/bin/thin-client-setup prepare explicitly')
@@ -1135,6 +1216,45 @@ def write_session_log(runtime, record):
         Path(temporary).unlink(missing_ok=True)
 
 
+@contextlib.contextmanager
+def core_prepare_guard(root):
+    """Direct prepare uses the same exclusive lock; autostart adopts its FD."""
+    path = session_lock_path(root)
+    inherited = os.environ.get(PREPARE_LOCK_FD)
+    if inherited is not None:
+        try:
+            fd = int(inherited)
+            opened, expected = os.fstat(fd), path.stat()
+        except (ValueError, OSError) as error:
+            raise RuntimeError('Invalid inherited preparation lock') from error
+        if (not stat.S_ISREG(opened.st_mode) or
+                (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)):
+            raise RuntimeError('Invalid inherited preparation lock')
+        lock = os.fdopen(os.dup(fd), 'a')
+    else:
+        lock = path.open('a')
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError('Core preparation or an application launch is active; '
+                               'quit native apps and check thin-client-setup session status') from error
+        runtime = root / 'runtime'
+        record = {'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  'core': 'preparing', 'prepare_started': True,
+                  'attempted_at': time.time(), 'result': 'running'}
+        write_session_log(runtime, record)
+        try:
+            yield
+        except BaseException as error:
+            record.update(result='failed', error=type(error).__name__)
+            write_session_log(runtime, record)
+            raise
+        else:
+            record.update(result='success', core='ready' if core_ready(root) else 'incomplete')
+            write_session_log(runtime, record)
+
+
 def session_status():
     print('1337 session')
     path = session_entry()
@@ -1183,9 +1303,7 @@ def session_init():
         ready = core_ready(root)  # Only local artifacts; no version/update checks.
         runtime = safe(root / 'runtime')
         runtime.mkdir(parents=True, exist_ok=True)
-        lock_path = safe(runtime / 'session-init.lock')
-        if lock_path.exists() and not lock_path.is_file():
-            raise RuntimeError('Expected a regular session lock')
+        lock_path = session_lock_path(root)
         with lock_path.open('a') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1212,6 +1330,7 @@ def session_init():
                 # while the original child is still running.
                 result = subprocess.run([sys.executable, str(Path(__file__).resolve()), 'prepare'],
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        env={**os.environ, PREPARE_LOCK_FD: str(lock.fileno())},
                                         pass_fds=(lock.fileno(),), check=False)
                 record['prepare_exit'] = result.returncode
                 ready = result.returncode == 0 and core_ready(root)
@@ -1405,7 +1524,9 @@ def main(argv=None):
         return
     os.umask(0o077)
     safe(STATE).mkdir(parents=True, exist_ok=True)
-    with (STATE / 'setup.lock').open('a') as lock:
+    preparation = (core_prepare_guard(root) if command in ['prepare', 'install', 'migrate', 'integrate']
+                   else contextlib.nullcontext())
+    with preparation, (STATE / 'setup.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         safe(root).mkdir(parents=True, exist_ok=True)
         if command in ['install', 'integrate', 'desktop', 'prepare', 'defaults']:
